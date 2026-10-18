@@ -2,12 +2,11 @@
 
 use std::time::Duration;
 
-use raft_kv_rs::node::{
-    get_redirect, put_redirect, spawn_cluster, spawn_node, wait_for_leader, NodeConfig,
-};
+mod common;
+
+use common::{ephemeral_addrs, spawn_cluster_at, spawn_one};
+use raft_kv_rs::node::{get_redirect, put_redirect, wait_for_leader};
 use raft_kv_rs::raft::TimingConfig;
-use std::collections::HashMap;
-use std::net::SocketAddr;
 
 fn fast_timing() -> TimingConfig {
     TimingConfig {
@@ -20,8 +19,8 @@ fn fast_timing() -> TimingConfig {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn follower_crash_put_still_works_then_restart_recovers() {
     let dir = tempfile::tempdir().unwrap();
-    let base = 17_300u16;
-    let mut handles = spawn_cluster(base, dir.path().to_path_buf(), fast_timing())
+    let addrs = ephemeral_addrs(3);
+    let mut handles = spawn_cluster_at(&addrs, dir.path(), fast_timing())
         .await
         .expect("cluster");
 
@@ -47,29 +46,11 @@ async fn follower_crash_put_still_works_then_restart_recovers() {
     let g = get_redirect(&handles, leader, "during").await;
     assert_eq!(g.value.as_deref(), Some("ok"));
 
-    // Restart follower with same data_dir
-    let addrs: Vec<(u64, SocketAddr)> = vec![
-        (1, format!("127.0.0.1:{base}").parse().unwrap()),
-        (2, format!("127.0.0.1:{}", base + 1).parse().unwrap()),
-        (3, format!("127.0.0.1:{}", base + 2).parse().unwrap()),
-    ];
-    let mut peers = HashMap::new();
-    for (oid, oaddr) in &addrs {
-        if *oid != follower_id {
-            peers.insert(*oid, *oaddr);
-        }
-    }
-    // Bind same address as before
-    let cfg = NodeConfig {
-        id: follower_id,
-        bind: follower_addr,
-        peers,
-        data_dir: dir.path().join(format!("node-{follower_id}")),
-        timing: fast_timing(),
-        learners: Vec::new(),
-        snapshot_threshold: 0,
-    };
-    let restarted = spawn_node(cfg).await.expect("restart");
+    // Restart follower with same data_dir on the same address
+    assert_eq!(addrs[(follower_id - 1) as usize].1, follower_addr);
+    let restarted = spawn_one(&addrs, follower_id, dir.path(), fast_timing())
+        .await
+        .expect("restart");
     handles.push(restarted);
 
     // Allow catch-up via AppendEntries
@@ -113,11 +94,11 @@ async fn follower_crash_put_still_works_then_restart_recovers() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn persist_survives_full_cluster_restart() {
     let dir = tempfile::tempdir().unwrap();
-    let base = 17_320u16;
+    let addrs = ephemeral_addrs(3);
     let timing = fast_timing();
 
     {
-        let handles = spawn_cluster(base, dir.path().to_path_buf(), timing.clone())
+        let handles = spawn_cluster_at(&addrs, dir.path(), timing.clone())
             .await
             .unwrap();
         let leader = wait_for_leader(&handles, Duration::from_secs(5))
@@ -132,9 +113,7 @@ async fn persist_survives_full_cluster_restart() {
     }
 
     // Cold start
-    let handles = spawn_cluster(base, dir.path().to_path_buf(), timing)
-        .await
-        .unwrap();
+    let handles = spawn_cluster_at(&addrs, dir.path(), timing).await.unwrap();
     let leader = wait_for_leader(&handles, Duration::from_secs(5))
         .await
         .unwrap();
