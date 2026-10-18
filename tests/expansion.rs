@@ -3,7 +3,10 @@
 
 use std::time::Duration;
 
-use raft_kv_rs::node::{spawn_cluster, wait_for_leader};
+mod common;
+
+use common::spawn_cluster;
+use raft_kv_rs::node::wait_for_leader;
 use raft_kv_rs::raft::{ClusterConfig, Membership, Outbound, RaftCore, Role, TimingConfig};
 use raft_kv_rs::rpc::{ClientRequest, Message};
 use raft_kv_rs::storage::Storage;
@@ -268,9 +271,7 @@ async fn snapshot_send_adds_chunk_bytes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn localhost_cluster_exposes_live_counters() {
     let dir = tempfile::tempdir().unwrap();
-    let handles = spawn_cluster(17_610, dir.path().to_path_buf(), timing())
-        .await
-        .expect("cluster");
+    let handles = spawn_cluster(dir.path(), timing()).await.expect("cluster");
     let leader_id = wait_for_leader(&handles, Duration::from_secs(5))
         .await
         .expect("leader");
