@@ -4,8 +4,8 @@ use std::time::Duration;
 
 mod common;
 
-use common::{ephemeral_addrs, spawn_cluster_at, spawn_one};
-use raft_kv_rs::node::{get_redirect, put_redirect, wait_for_leader};
+use common::{ephemeral_addrs, get_ok, put_ok, spawn_cluster_at, spawn_one};
+use raft_kv_rs::node::wait_for_leader;
 use raft_kv_rs::raft::TimingConfig;
 
 fn fast_timing() -> TimingConfig {
@@ -29,7 +29,7 @@ async fn follower_crash_put_still_works_then_restart_recovers() {
         .expect("leader");
 
     // Initial commit while healthy
-    let r0 = put_redirect(&handles, leader, "before", "crash").await;
+    let r0 = put_ok(&handles, leader, "before", "crash").await;
     assert!(r0.ok, "{:?}", r0.error);
 
     // Pick a follower to kill
@@ -40,10 +40,10 @@ async fn follower_crash_put_still_works_then_restart_recovers() {
     crashed.shutdown().await;
 
     // Majority of 2/3 still commits
-    let r1 = put_redirect(&handles, leader, "during", "ok").await;
+    let r1 = put_ok(&handles, leader, "during", "ok").await;
     assert!(r1.ok, "put during follower outage failed: {:?}", r1.error);
 
-    let g = get_redirect(&handles, leader, "during").await;
+    let g = get_ok(&handles, leader, "during").await;
     assert_eq!(g.value.as_deref(), Some("ok"));
 
     // Restart follower with same data_dir on the same address
@@ -60,16 +60,16 @@ async fn follower_crash_put_still_works_then_restart_recovers() {
     let leader2 = wait_for_leader(&handles, Duration::from_secs(5))
         .await
         .expect("leader after restart");
-    let r2 = put_redirect(&handles, leader2, "after", "recovered").await;
+    let r2 = put_ok(&handles, leader2, "after", "recovered").await;
     assert!(r2.ok, "{:?}", r2.error);
 
     // Restarted node should know about committed keys once caught up.
     // We verify via leader read (linearizable path) and that cluster still has one leader.
-    let got = get_redirect(&handles, leader2, "before").await;
+    let got = get_ok(&handles, leader2, "before").await;
     assert_eq!(got.value.as_deref(), Some("crash"));
-    let got2 = get_redirect(&handles, leader2, "during").await;
+    let got2 = get_ok(&handles, leader2, "during").await;
     assert_eq!(got2.value.as_deref(), Some("ok"));
-    let got3 = get_redirect(&handles, leader2, "after").await;
+    let got3 = get_ok(&handles, leader2, "after").await;
     assert_eq!(got3.value.as_deref(), Some("recovered"));
 
     // Status on restarted node: log should have grown
@@ -104,7 +104,7 @@ async fn persist_survives_full_cluster_restart() {
         let leader = wait_for_leader(&handles, Duration::from_secs(5))
             .await
             .unwrap();
-        assert!(put_redirect(&handles, leader, "durable", "yes").await.ok);
+        assert!(put_ok(&handles, leader, "durable", "yes").await.ok);
         // Ensure commit persisted
         tokio::time::sleep(Duration::from_millis(200)).await;
         for h in handles {
@@ -118,7 +118,7 @@ async fn persist_survives_full_cluster_restart() {
         .await
         .unwrap();
     // After restart, KV is rebuilt from durable commit_index.
-    let got = get_redirect(&handles, leader, "durable").await;
+    let got = get_ok(&handles, leader, "durable").await;
     assert!(
         got.ok && got.value.as_deref() == Some("yes"),
         "expected durable value after restart, got {:?}",

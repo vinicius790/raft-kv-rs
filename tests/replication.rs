@@ -2,7 +2,10 @@
 
 use std::time::Duration;
 
-use raft_kv_rs::node::{get_redirect, put_redirect, spawn_cluster, wait_for_leader};
+mod common;
+
+use common::{get_ok, put_ok, spawn_cluster};
+use raft_kv_rs::node::wait_for_leader;
 use raft_kv_rs::raft::TimingConfig;
 
 fn fast_timing() -> TimingConfig {
@@ -16,18 +19,18 @@ fn fast_timing() -> TimingConfig {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn put_get_replicated() {
     let dir = tempfile::tempdir().unwrap();
-    let handles = spawn_cluster(17_200, dir.path().to_path_buf(), fast_timing())
+    let handles = spawn_cluster(dir.path(), fast_timing())
         .await
         .expect("cluster");
     let leader = wait_for_leader(&handles, Duration::from_secs(5))
         .await
         .expect("leader");
 
-    let resp = put_redirect(&handles, leader, "alpha", "1").await;
+    let resp = put_ok(&handles, leader, "alpha", "1").await;
     assert!(resp.ok, "put failed: {:?}", resp.error);
 
     // Read from leader
-    let got = get_redirect(&handles, leader, "alpha").await;
+    let got = get_ok(&handles, leader, "alpha").await;
     assert!(got.ok, "get failed: {:?}", got.error);
     assert_eq!(got.value.as_deref(), Some("1"));
 
@@ -46,9 +49,9 @@ async fn put_get_replicated() {
     assert!(st.kv_len >= 1, "kv_len={}", st.kv_len);
 
     // Overwrite
-    let resp2 = put_redirect(&handles, leader, "alpha", "2").await;
+    let resp2 = put_ok(&handles, leader, "alpha", "2").await;
     assert!(resp2.ok);
-    let got2 = get_redirect(&handles, leader, "alpha").await;
+    let got2 = get_ok(&handles, leader, "alpha").await;
     assert_eq!(got2.value.as_deref(), Some("2"));
 
     for h in handles {
@@ -59,7 +62,7 @@ async fn put_get_replicated() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn follower_redirects_put() {
     let dir = tempfile::tempdir().unwrap();
-    let handles = spawn_cluster(17_210, dir.path().to_path_buf(), fast_timing())
+    let handles = spawn_cluster(dir.path(), fast_timing())
         .await
         .expect("cluster");
     let leader = wait_for_leader(&handles, Duration::from_secs(5))
@@ -72,7 +75,7 @@ async fn follower_redirects_put() {
     assert_eq!(direct.leader_hint, Some(leader));
 
     // Redirect helper should still succeed
-    let ok = put_redirect(&handles, follower.id, "k", "v").await;
+    let ok = put_ok(&handles, follower.id, "k", "v").await;
     assert!(ok.ok, "{:?}", ok.error);
 
     for h in handles {

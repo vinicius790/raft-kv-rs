@@ -6,8 +6,9 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
-use raft_kv_rs::node::{spawn_node, NodeConfig, NodeHandle};
+use raft_kv_rs::node::{get_redirect, put_redirect, spawn_node, NodeConfig, NodeHandle};
 use raft_kv_rs::raft::TimingConfig;
+use raft_kv_rs::rpc::ClientResponse;
 
 /// Ask the OS for `n` free loopback ports (bind 127.0.0.1:0 while all are
 /// held, so they are distinct), then release them for the nodes. No fixed
@@ -78,4 +79,30 @@ pub async fn spawn_cluster_at(
 /// Three-node cluster on fresh ephemeral ports.
 pub async fn spawn_cluster(root: &Path, timing: TimingConfig) -> anyhow::Result<Vec<NodeHandle>> {
     spawn_cluster_at(&ephemeral_addrs(3), root, timing).await
+}
+
+/// `get_redirect` until a node answers `ok`, for up to 5 s. An election in
+/// progress makes single attempts fail with `not leader`; a value is only
+/// checked once a leader actually served the read.
+pub async fn get_ok(handles: &[NodeHandle], start: u64, key: &str) -> ClientResponse {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let r = get_redirect(handles, start, key).await;
+        if r.ok || tokio::time::Instant::now() >= deadline {
+            return r;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// `put_redirect` until it reports `ok`, for up to 5 s (same reason as `get_ok`).
+pub async fn put_ok(handles: &[NodeHandle], start: u64, key: &str, value: &str) -> ClientResponse {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let r = put_redirect(handles, start, key, value).await;
+        if r.ok || tokio::time::Instant::now() >= deadline {
+            return r;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
