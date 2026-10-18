@@ -2,6 +2,7 @@
 //! joint membership, chunked snapshots, pre-vote, read index, leadership transfer.
 
 pub mod client;
+pub mod http;
 pub mod kv;
 pub mod node;
 pub mod observe;
@@ -11,6 +12,7 @@ pub mod raft;
 pub mod rpc;
 pub mod sim;
 pub mod storage;
+pub mod telemetry;
 pub mod transport;
 
 pub use client::SessionClient;
