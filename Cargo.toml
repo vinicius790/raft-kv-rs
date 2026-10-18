@@ -25,6 +25,9 @@ clap = { version = "4", features = ["derive"] }
 rand = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axum = "0.8"
+metrics = { version = "0.24", default-features = false }
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"], optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
 rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"], optional = true }
@@ -32,6 +35,8 @@ rustls-pki-types = { version = "1", features = ["std"], optional = true }
 
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs", "test-util"] }
 turmoil = "0.7.2"
