@@ -42,6 +42,8 @@ pub enum Message {
         prev_log_term: Term,
         entries: Vec<LogEntry>,
         leader_commit: LogIndex,
+        /// Leader's read-index round when this was sent. The follower echoes it.
+        read_ctx: u64,
     },
     AppendEntriesResponse {
         term: Term,
@@ -50,6 +52,8 @@ pub enum Message {
         conflict_index: LogIndex,
         /// True when follower needs InstallSnapshot (gap / compacted).
         need_snapshot: bool,
+        /// Echo of the `read_ctx` of the AppendEntries being answered.
+        read_ctx: u64,
     },
     InstallSnapshot {
         term: Term,

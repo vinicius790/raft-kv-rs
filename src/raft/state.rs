@@ -74,8 +74,11 @@ pub struct InflightAppend {
 pub struct LeaderState {
     pub next_index: HashMap<NodeId, LogIndex>,
     pub match_index: HashMap<NodeId, LogIndex>,
-    /// Peers that have acknowledged a heartbeat in the current term (read-index).
+    /// Peers (plus self) that answered an AppendEntries carrying the current
+    /// `read_round`. Acks from earlier rounds are not counted (read-index).
     pub heartbeat_acks: HashSet<NodeId>,
+    /// Read-index round. Bumped by each linearizable read; sent as `read_ctx`.
+    pub read_round: u64,
     /// Pipelined AppendEntries not yet covered by match_index.
     pub inflight: HashMap<NodeId, Vec<InflightAppend>>,
     /// Sum of `inflight` bytes per peer. Replication pauses at the cap.
@@ -101,6 +104,7 @@ impl LeaderState {
             next_index,
             match_index,
             heartbeat_acks: HashSet::new(),
+            read_round: 0,
             inflight: HashMap::new(),
             inflight_bytes: HashMap::new(),
             snap_offset: HashMap::new(),
