@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use raft_mvp::node::{spawn_node, NodeConfig, NodeHandle};
-use raft_mvp::raft::TimingConfig;
+use raft_kv_rs::node::{spawn_node, NodeConfig, NodeHandle};
+use raft_kv_rs::raft::TimingConfig;
 
 fn free_addr() -> SocketAddr {
     std::net::TcpListener::bind("127.0.0.1:0")
