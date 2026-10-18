@@ -2,7 +2,10 @@
 
 use std::time::Duration;
 
-use raft_kv_rs::node::{spawn_cluster, wait_for_leader};
+mod common;
+
+use common::spawn_cluster;
+use raft_kv_rs::node::wait_for_leader;
 use raft_kv_rs::raft::TimingConfig;
 
 fn fast_timing() -> TimingConfig {
@@ -16,7 +19,7 @@ fn fast_timing() -> TimingConfig {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn elects_leader_among_three() {
     let dir = tempfile::tempdir().unwrap();
-    let handles = spawn_cluster(17_100, dir.path().to_path_buf(), fast_timing())
+    let handles = spawn_cluster(dir.path(), fast_timing())
         .await
         .expect("cluster");
     let leader = wait_for_leader(&handles, Duration::from_secs(5))
@@ -47,7 +50,7 @@ async fn elects_leader_among_three() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reelects_after_leader_crash() {
     let dir = tempfile::tempdir().unwrap();
-    let mut handles = spawn_cluster(17_110, dir.path().to_path_buf(), fast_timing())
+    let mut handles = spawn_cluster(dir.path(), fast_timing())
         .await
         .expect("cluster");
     let leader_id = wait_for_leader(&handles, Duration::from_secs(5))
