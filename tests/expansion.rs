@@ -3,11 +3,11 @@
 
 use std::time::Duration;
 
-use raft_mvp::node::{spawn_cluster, wait_for_leader};
-use raft_mvp::raft::{ClusterConfig, Membership, Outbound, RaftCore, Role, TimingConfig};
-use raft_mvp::rpc::{ClientRequest, Message};
-use raft_mvp::storage::Storage;
-use raft_mvp::SessionClient;
+use raft_kv_rs::node::{spawn_cluster, wait_for_leader};
+use raft_kv_rs::raft::{ClusterConfig, Membership, Outbound, RaftCore, Role, TimingConfig};
+use raft_kv_rs::rpc::{ClientRequest, Message};
+use raft_kv_rs::storage::Storage;
+use raft_kv_rs::SessionClient;
 
 fn timing() -> TimingConfig {
     TimingConfig {
@@ -241,6 +241,7 @@ async fn snapshot_send_adds_chunk_bytes() {
                 match_index: last,
                 conflict_index: 0,
                 need_snapshot: false,
+                read_ctx: 0,
             },
             0,
         )

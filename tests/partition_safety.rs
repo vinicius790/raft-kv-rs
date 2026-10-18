@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use raft_mvp::node::{spawn_node, wait_for_leader, NodeConfig, NodeHandle};
-use raft_mvp::raft::TimingConfig;
+use raft_kv_rs::node::{spawn_node, wait_for_leader, NodeConfig, NodeHandle};
+use raft_kv_rs::raft::TimingConfig;
 
 fn fast_timing() -> TimingConfig {
     TimingConfig {
