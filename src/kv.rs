@@ -27,6 +27,10 @@ pub enum Command {
         key: String,
         value: String,
     },
+    /// Remove a key. Appended last so older bincode variant tags stay stable.
+    Delete {
+        key: String,
+    },
 }
 
 #[derive(Debug, Default, Clone)]
@@ -59,6 +63,9 @@ impl KvStore {
                 }
                 self.sessions.insert(*client_id, *serial);
                 self.map.insert(key.clone(), value.clone());
+            }
+            Command::Delete { key } => {
+                self.map.remove(key);
             }
         }
     }

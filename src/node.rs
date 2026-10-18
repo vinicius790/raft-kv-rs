@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{info, warn, Instrument};
 
 use crate::raft::{Outbound, RaftCore, Role, TimingConfig};
 use crate::rpc::{ClientRequest, ClientResponse, LogIndex, Message, NodeId, NodeStatus};
@@ -64,6 +64,32 @@ enum NodeCmd {
 }
 
 impl NodeHandle {
+    /// Cheap handle sharing the command channel. It cannot shut the node down;
+    /// only the original handle owns shutdown.
+    pub fn client(&self) -> NodeHandle {
+        NodeHandle {
+            id: self.id,
+            addr: self.addr,
+            cmd_tx: self.cmd_tx.clone(),
+            shutdown_tx: Mutex::new(None),
+            join: Mutex::new(None),
+        }
+    }
+
+    /// Delete a key through the log (leader only; waits for commit).
+    pub async fn delete(&self, key: impl Into<String>) -> ClientResponse {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .cmd_tx
+            .send(NodeCmd::Client {
+                req: ClientRequest::Delete { key: key.into() },
+                resp: tx,
+            })
+            .await;
+        rx.await
+            .unwrap_or_else(|_| ClientResponse::err("node gone"))
+    }
+
     pub async fn put(&self, key: impl Into<String>, value: impl Into<String>) -> ClientResponse {
         let (tx, rx) = oneshot::channel();
         let _ = self
@@ -303,6 +329,10 @@ async fn run_loop(
     // Map corr → pending slot for inbound client replies
     let mut corr_replies: HashMap<u64, PendingPut> = HashMap::new();
 
+    // Oldest outstanding AppendEntries per peer, for the latency histogram.
+    let mut append_sent: HashMap<NodeId, tokio::time::Instant> = HashMap::new();
+    let mut last_published = tokio::time::Instant::now() - Duration::from_secs(1);
+
     info!(node = core.id, "raft node online");
 
     loop {
@@ -318,6 +348,7 @@ async fn run_loop(
             }
             _ = &mut heartbeat => {
                 let out = core.on_heartbeat_timeout().await?;
+                track_appends(&out, &mut append_sent);
                 apply_outbound(&mut core, &peers, out, &mut election, &mut heartbeat, &mut pending, &mut corr_replies).await;
                 core.maybe_auto_snapshot().await?;
             }
@@ -333,7 +364,20 @@ async fn run_loop(
                         read_term: 0,
                     });
                 }
-                let out = core.handle_message(inbound.from, inbound.msg, corr).await?;
+                if let (Some(from), Message::AppendEntriesResponse { .. }) = (inbound.from, &inbound.msg) {
+                    if let Some(t0) = append_sent.remove(&from) {
+                        crate::telemetry::record_append_latency(core.id, from, t0.elapsed());
+                    }
+                }
+                let span = tracing::debug_span!(
+                    "rpc",
+                    node = core.id,
+                    kind = msg_kind(&inbound.msg),
+                    peer = ?inbound.from,
+                    term = core.persistent.current_term
+                );
+                let out = core.handle_message(inbound.from, inbound.msg, corr).instrument(span).await?;
+                track_appends(&out, &mut append_sent);
                 apply_outbound(&mut core, &peers, out, &mut election, &mut heartbeat, &mut pending, &mut corr_replies).await;
                 core.maybe_auto_snapshot().await?;
                 flush_pending_commits(&core, &mut pending, &mut corr_replies).await;
@@ -362,6 +406,7 @@ async fn run_loop(
                             read_term: 0,
                         });
                         let out = core.handle_message(None, Message::Client(req), corr).await?;
+                        track_appends(&out, &mut append_sent);
                         apply_outbound(&mut core, &peers, out, &mut election, &mut heartbeat, &mut pending, &mut corr_replies).await;
                         core.maybe_auto_snapshot().await?;
                         flush_pending_commits(&core, &mut pending, &mut corr_replies).await;
@@ -369,8 +414,40 @@ async fn run_loop(
                 }
             }
         }
+        if last_published.elapsed() >= Duration::from_millis(50) {
+            crate::telemetry::record_snapshot(&core.metrics());
+            last_published = tokio::time::Instant::now();
+        }
     }
     Ok(())
+}
+
+fn track_appends(out: &[Outbound], sent: &mut HashMap<NodeId, tokio::time::Instant>) {
+    for ob in out {
+        if let Outbound::Send {
+            to,
+            msg: Message::AppendEntries { .. },
+        } = ob
+        {
+            sent.entry(*to).or_insert_with(tokio::time::Instant::now);
+        }
+    }
+}
+
+fn msg_kind(m: &Message) -> &'static str {
+    match m {
+        Message::RequestVote { .. } => "request_vote",
+        Message::RequestVoteResponse { .. } => "request_vote_resp",
+        Message::PreVote { .. } => "pre_vote",
+        Message::PreVoteResponse { .. } => "pre_vote_resp",
+        Message::AppendEntries { .. } => "append_entries",
+        Message::AppendEntriesResponse { .. } => "append_entries_resp",
+        Message::InstallSnapshot { .. } => "install_snapshot",
+        Message::InstallSnapshotResponse { .. } => "install_snapshot_resp",
+        Message::TimeoutNow { .. } => "timeout_now",
+        Message::Client(_) => "client",
+        _ => "admin",
+    }
 }
 
 async fn apply_outbound(

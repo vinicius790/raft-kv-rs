@@ -1651,7 +1651,8 @@ impl RaftCore {
             | ClientRequest::SessionPut { .. }
             | ClientRequest::ChangeMembership { .. }
             | ClientRequest::TransferLeadership { .. }
-            | ClientRequest::PromoteLearner { .. } => {
+            | ClientRequest::PromoteLearner { .. }
+            | ClientRequest::Delete { .. } => {
                 if self.volatile.role != Role::Leader {
                     return Ok(vec![Outbound::ClientReply {
                         corr,
@@ -1702,10 +1703,15 @@ impl RaftCore {
                 out.push(Outbound::ResetHeartbeatTimer);
                 Ok(out)
             }
-            ClientRequest::Put { key, value } => {
+            ClientRequest::Put { .. } | ClientRequest::Delete { .. } => {
+                let command = match req {
+                    ClientRequest::Put { key, value } => Command::Put { key, value },
+                    ClientRequest::Delete { key } => Command::Delete { key },
+                    _ => unreachable!(),
+                };
                 self.persistent.log.append(LogEntry {
                     term: self.persistent.current_term,
-                    command: Command::Put { key, value },
+                    command,
                 });
                 self.persist().await?;
                 let wait_index = self.persistent.log.last_index();
