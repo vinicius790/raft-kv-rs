@@ -105,6 +105,7 @@ async fn joint_change_does_not_commit_without_overlapping_quorum() {
                     match_index: joint_idx,
                     conflict_index: 0,
                     need_snapshot: false,
+                    read_ctx: 0,
                 },
                 0,
             )
@@ -126,6 +127,7 @@ async fn joint_change_does_not_commit_without_overlapping_quorum() {
                 match_index: joint_idx,
                 conflict_index: 0,
                 need_snapshot: false,
+                read_ctx: 0,
             },
             0,
         )
@@ -362,6 +364,7 @@ async fn leadership_transfer_keeps_committed_prefix() {
                 match_index: match_idx,
                 conflict_index: 0,
                 need_snapshot: false,
+                read_ctx: 0,
             },
             0,
         )
@@ -476,6 +479,7 @@ async fn stale_leader_does_not_serve_read_index() {
                     match_index: idx,
                     conflict_index: 0,
                     need_snapshot: false,
+                    read_ctx: 0,
                 },
                 0,
             )
@@ -500,7 +504,8 @@ async fn stale_leader_does_not_serve_read_index() {
         "partitioned leader must not answer a linearizable read, got {out:?}"
     );
     assert!(leader.pending_reads.iter().any(|r| r.0 == 42));
-    // Quorum heartbeat from one follower unblocks the read.
+    // Quorum heartbeat from one follower, answering the round opened by the read.
+    let round = leader.leader.as_ref().unwrap().read_round;
     let ready = leader
         .handle_message(
             Some(2),
@@ -510,6 +515,7 @@ async fn stale_leader_does_not_serve_read_index() {
                 match_index: leader.last_log_index(),
                 conflict_index: 0,
                 need_snapshot: false,
+                read_ctx: round,
             },
             0,
         )
@@ -577,6 +583,7 @@ async fn learner_cannot_elect_or_decide_commit_then_promotes() {
                 match_index: idx,
                 conflict_index: 0,
                 need_snapshot: false,
+                read_ctx: 0,
             },
             0,
         )
@@ -613,6 +620,7 @@ async fn learner_cannot_elect_or_decide_commit_then_promotes() {
                     match_index: joint_idx,
                     conflict_index: 0,
                     need_snapshot: false,
+                    read_ctx: 0,
                 },
                 0,
             )
@@ -679,6 +687,7 @@ async fn batch_append_entries_and_gap_rejected() {
                     },
                 }],
                 leader_commit: 0,
+                read_ctx: 0,
             },
             0,
         )
@@ -754,6 +763,7 @@ async fn metrics_report_term_commit_and_lag() {
                 match_index: last.saturating_sub(1),
                 conflict_index: 0,
                 need_snapshot: false,
+                read_ctx: 0,
             },
             0,
         )
@@ -1131,6 +1141,7 @@ async fn flow_control_pauses_until_ack() {
                 match_index: 1,
                 conflict_index: 0,
                 need_snapshot: false,
+                read_ctx: 0,
             },
             0,
         )
@@ -1211,6 +1222,7 @@ async fn second_membership_change_waits_until_first_commits() {
                 match_index: joint_idx,
                 conflict_index: 0,
                 need_snapshot: false,
+                read_ctx: 0,
             },
             0,
         )
@@ -1245,6 +1257,7 @@ async fn second_membership_change_waits_until_first_commits() {
                 match_index: cnew,
                 conflict_index: 0,
                 need_snapshot: false,
+                read_ctx: 0,
             },
             0,
         )
@@ -1297,6 +1310,7 @@ async fn default_get_blocked_on_partitioned_leader() {
                     match_index: idx,
                     conflict_index: 0,
                     need_snapshot: false,
+                    read_ctx: 0,
                 },
                 0,
             )
@@ -1392,4 +1406,163 @@ async fn simulator_packet_loss_membership_change() {
     assert_eq!(ran.last().copied(), Some(80));
     assert_eq!(ran.len(), 40, "ran membership-loss seeds {ran:?}");
     eprintln!("membership-loss seeds ran: {ran:?}");
+}
+
+fn served_value(out: &[Outbound], corr: u64) -> Option<Option<String>> {
+    out.iter().find_map(|o| match o {
+        Outbound::ClientReply { corr: c, resp } if *c == corr && resp.ok => {
+            Some(resp.value.clone())
+        }
+        _ => None,
+    })
+}
+
+/// Regression (thesis §6.4): a new leader whose commit index lags must not
+/// serve a read before its own term's noop commits.
+#[tokio::test]
+async fn read_index_waits_for_noop_of_current_term() {
+    let (_d, mut n) = fresh(1, vec![2, 3]).await;
+    n.enable_pre_vote = false;
+    // Template entry with the crate's LogEntry type: elect a throwaway leader.
+    let (_t, tmpl) = elect_leader(vec![2]).await;
+    let put = |v: &str| {
+        let mut e = tmpl.persistent.log.entry(1).cloned().unwrap();
+        e.term = 1;
+        e.command = Command::Put {
+            key: "x".into(),
+            value: v.into(),
+        };
+        e
+    };
+    let (e1, e2) = (put("1"), put("2"));
+    // Term-1 leader 2 replicated x=1 and x=2; node 1 only learned commit of index 1.
+    n.handle_message(
+        Some(2),
+        Message::AppendEntries {
+            term: 1,
+            leader_id: 2,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![e1, e2],
+            leader_commit: 1,
+            read_ctx: 0,
+        },
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(n.kv.get("x").map(String::as_str), Some("1"));
+    n.on_election_timeout().await.unwrap();
+    let term = n.persistent.current_term;
+    for p in [2, 3] {
+        n.handle_message(
+            Some(p),
+            Message::RequestVoteResponse {
+                term,
+                vote_granted: true,
+            },
+            0,
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(n.volatile.role, Role::Leader);
+    let noop = n.last_log_index();
+    let out = n
+        .handle_message(
+            None,
+            Message::Client(ClientRequest::Get { key: "x".into() }),
+            9,
+        )
+        .await
+        .unwrap();
+    assert_eq!(served_value(&out, 9), None);
+    let round = n.leader.as_ref().unwrap().read_round;
+    // Both peers answer this round but have not stored the noop yet.
+    let mut all = Vec::new();
+    for p in [2, 3] {
+        all.extend(
+            n.handle_message(
+                Some(p),
+                Message::AppendEntriesResponse {
+                    term,
+                    success: true,
+                    match_index: noop - 1,
+                    conflict_index: 0,
+                    need_snapshot: false,
+                    read_ctx: round,
+                },
+                0,
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    assert_eq!(
+        served_value(&all, 9),
+        None,
+        "read served before this term's noop committed: {all:?}"
+    );
+    // Noop reaches a quorum: commit covers x=2 and the read returns it.
+    let out = n
+        .handle_message(
+            Some(2),
+            Message::AppendEntriesResponse {
+                term,
+                success: true,
+                match_index: noop,
+                conflict_index: 0,
+                need_snapshot: false,
+                read_ctx: round,
+            },
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(served_value(&out, 9), Some(Some("2".to_string())));
+}
+
+/// Regression: an ack to a heartbeat sent before the read arrived does not
+/// prove leadership for that read. Only the current round counts.
+#[tokio::test]
+async fn read_index_ignores_acks_from_earlier_round() {
+    let (_d, mut leader) = elect_leader(vec![2, 3]).await;
+    let term = leader.persistent.current_term;
+    let li = leader.last_log_index();
+    let ack = |read_ctx| Message::AppendEntriesResponse {
+        term,
+        success: true,
+        match_index: li,
+        conflict_index: 0,
+        need_snapshot: false,
+        read_ctx,
+    };
+    for p in [2, 3] {
+        leader.handle_message(Some(p), ack(0), 0).await.unwrap();
+    }
+    assert_eq!(leader.commit_index(), li, "noop committed");
+    let before = leader.leader.as_ref().unwrap().read_round;
+    leader.on_heartbeat_timeout().await.unwrap();
+    let out = leader
+        .handle_message(
+            None,
+            Message::Client(ClientRequest::Get { key: "x".into() }),
+            11,
+        )
+        .await
+        .unwrap();
+    assert_eq!(served_value(&out, 11), None);
+    let round = leader.leader.as_ref().unwrap().read_round;
+    assert!(round > before);
+    let late = leader
+        .handle_message(Some(2), ack(before), 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        served_value(&late, 11),
+        None,
+        "stale-round ack confirmed a read: {late:?}"
+    );
+    let fresh_ack = leader.handle_message(Some(2), ack(round), 0).await.unwrap();
+    assert_eq!(served_value(&fresh_ack, 11), Some(None));
 }

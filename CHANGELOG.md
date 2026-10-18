@@ -2,6 +2,16 @@
 
 O formato segue o espírito de Keep a Changelog: versão, data, o que entrou e o que continua de fora. Não há seção de desempenho.
 
+## Não lançado
+
+### Corrigido
+
+- Read index podia devolver valor velho (tese do Raft, §6.4). (1) Um líder recém-eleito respondia antes de commitar o noop do próprio termo, com `commit_index` atrasado. (2) Ack de um heartbeat enviado **antes** da leitura contava como confirmação de liderança. Agora a leitura espera o noop do termo commitado e um quorum de respostas da rodada aberta por ela. Testes: `read_index_waits_for_noop_of_current_term`, `read_index_ignores_acks_from_earlier_round`.
+
+### Protocolo
+
+- `AppendEntries` e `AppendEntriesResponse` ganharam o campo `read_ctx: u64` (o follower ecoa). O frame bincode muda: nós desta versão não conversam com nós da anterior; atualize o cluster inteiro de uma vez. `raft-state.bin` não mudou.
+
 ## 1000000.0.0 — 2026-10-03
 
 O número **1000000.0.0** foi pedido explicitamente. Não declara maturidade de produção, não aproxima este crate de etcd e não congela uma API nova de disco. O layout de `raft-state.bin` continua a versão 1.
