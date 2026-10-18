@@ -7,11 +7,11 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use raft_mvp::node::{get_redirect, put_redirect, spawn_node_with, wait_for_leader, NodeConfig};
-use raft_mvp::raft::TimingConfig;
-use raft_mvp::rpc::Message;
-use raft_mvp::tls::TlsMaterial;
-use raft_mvp::transport::{PeerMap, PeerPool, PoolConfig, Security};
+use raft_kv_rs::node::{get_redirect, put_redirect, spawn_node_with, wait_for_leader, NodeConfig};
+use raft_kv_rs::raft::TimingConfig;
+use raft_kv_rs::rpc::Message;
+use raft_kv_rs::tls::TlsMaterial;
+use raft_kv_rs::transport::{PeerMap, PeerPool, PoolConfig, Security};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
 
 struct Ca {
@@ -96,7 +96,7 @@ async fn tls_cluster_elects_and_replicates() {
 
     // An anonymous TLS client (CA only, no cert) can use the client path.
     let client = Security::tls(TlsMaterial::client_only(ca.pem.as_bytes()).unwrap());
-    let reply = raft_mvp::transport::client_request_secure(
+    let reply = raft_kv_rs::transport::client_request_secure(
         addrs[&leader],
         Message::StatusRequest,
         Duration::from_secs(3),
@@ -109,7 +109,7 @@ async fn tls_cluster_elects_and_replicates() {
         Message::StatusResponse(_) | Message::ClientReply(_)
     ));
     // A plain-TCP client gets nothing from a TLS node.
-    assert!(raft_mvp::transport::client_request(
+    assert!(raft_kv_rs::transport::client_request(
         addrs[&leader],
         Message::StatusRequest,
         Duration::from_millis(500)
@@ -221,6 +221,7 @@ async fn anonymous_tls_client_cannot_send_peer_rpcs() {
             prev_log_term: 0,
             entries: Vec::new(),
             leader_commit: 0,
+            read_ctx: 0,
         },
         Message::RequestVote {
             term: term + 200,
@@ -235,7 +236,7 @@ async fn anonymous_tls_client_cannot_send_peer_rpcs() {
     ];
     for target in addrs.values() {
         for msg in &attacks {
-            let r = raft_mvp::transport::client_request_secure(
+            let r = raft_kv_rs::transport::client_request_secure(
                 *target,
                 msg.clone(),
                 Duration::from_millis(300),

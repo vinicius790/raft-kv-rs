@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use raft_mvp::rpc::Message;
-use raft_mvp::transport::{Frame, PeerMap, PeerPool, PoolConfig};
+use raft_kv_rs::rpc::Message;
+use raft_kv_rs::transport::{Frame, PeerMap, PeerPool, PoolConfig};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
