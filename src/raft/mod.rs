@@ -356,6 +356,12 @@ impl RaftCore {
     }
 
     pub async fn on_election_timeout(&mut self) -> anyhow::Result<Vec<Outbound>> {
+        let mut out = self.election_timeout_inner().await?;
+        out.extend(self.abort_reads_if_deposed());
+        Ok(out)
+    }
+
+    async fn election_timeout_inner(&mut self) -> anyhow::Result<Vec<Outbound>> {
         if self.volatile.role == Role::Leader {
             return self.on_check_quorum().await;
         }
@@ -502,12 +508,14 @@ impl RaftCore {
     }
 
     pub async fn on_heartbeat_timeout(&mut self) -> anyhow::Result<Vec<Outbound>> {
+        let mut out = self.heartbeat_timeout_inner().await?;
+        out.extend(self.abort_reads_if_deposed());
+        Ok(out)
+    }
+
+    async fn heartbeat_timeout_inner(&mut self) -> anyhow::Result<Vec<Outbound>> {
         if self.volatile.role != Role::Leader {
             return Ok(vec![]);
-        }
-        if let Some(leader) = self.leader.as_mut() {
-            leader.heartbeat_acks.clear();
-            leader.heartbeat_acks.insert(self.id);
         }
         let mut out = self.broadcast_append_entries();
         out.push(Outbound::ResetHeartbeatTimer);
@@ -632,6 +640,7 @@ impl RaftCore {
                 prev_log_term: prev_term,
                 entries: Vec::new(),
                 leader_commit: self.volatile.commit_index,
+                read_ctx: self.read_ctx(),
             },
         }]
     }
@@ -660,8 +669,6 @@ impl RaftCore {
         if effective + 1 > ni {
             leader.next_index.insert(peer, effective + 1);
         }
-        leader.heartbeat_acks.insert(peer);
-        leader.heartbeat_acks.insert(self_id);
         leader.contact.insert(peer);
         leader.contact.insert(self_id);
     }
@@ -755,10 +762,51 @@ impl RaftCore {
             prev_log_term: prev_term,
             entries,
             leader_commit: self.volatile.commit_index,
+            read_ctx: self.read_ctx(),
         }
     }
 
+    /// Current read-index round, sent in every AppendEntries (0 when not leader).
+    fn read_ctx(&self) -> u64 {
+        self.leader.as_ref().map_or(0, |l| l.read_round)
+    }
+
     pub async fn handle_message(
+        &mut self,
+        from: Option<NodeId>,
+        msg: Message,
+        corr: u64,
+    ) -> anyhow::Result<Vec<Outbound>> {
+        let mut out = self.handle_message_inner(from, msg, corr).await?;
+        out.extend(self.abort_reads_if_deposed());
+        Ok(out)
+    }
+
+    /// A read parked on the read-index quorum can only be served by the
+    /// leader of the term it arrived in. Once this node is no longer that
+    /// leader, no ack will ever confirm it: answer `not leader` now instead of
+    /// leaving the client waiting forever.
+    fn abort_reads_if_deposed(&mut self) -> Vec<Outbound> {
+        if self.pending_reads.is_empty() {
+            return vec![];
+        }
+        let term = self.persistent.current_term;
+        let leading = self.volatile.role == Role::Leader;
+        let hint = self.volatile.leader_id.filter(|&l| l != self.id);
+        let (stale, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_reads)
+            .into_iter()
+            .partition(|(_, _, read_term)| !leading || *read_term != term);
+        self.pending_reads = keep;
+        stale
+            .into_iter()
+            .map(|(corr, _, _)| Outbound::ClientReply {
+                corr,
+                resp: ClientResponse::not_leader(hint),
+            })
+            .collect()
+    }
+
+    async fn handle_message_inner(
         &mut self,
         from: Option<NodeId>,
         msg: Message,
@@ -800,6 +848,7 @@ impl RaftCore {
                 prev_log_term,
                 entries,
                 leader_commit,
+                read_ctx,
             } => {
                 self.handle_append_entries(
                     from,
@@ -809,6 +858,7 @@ impl RaftCore {
                     prev_log_term,
                     entries,
                     leader_commit,
+                    read_ctx,
                 )
                 .await
             }
@@ -818,6 +868,7 @@ impl RaftCore {
                 match_index,
                 conflict_index,
                 need_snapshot,
+                read_ctx,
             } => {
                 self.handle_ae_response(
                     from,
@@ -826,6 +877,7 @@ impl RaftCore {
                     match_index,
                     conflict_index,
                     need_snapshot,
+                    read_ctx,
                 )
                 .await
             }
@@ -1053,6 +1105,7 @@ impl RaftCore {
         prev_log_term: Term,
         entries: Vec<LogEntry>,
         leader_commit: LogIndex,
+        read_ctx: u64,
     ) -> anyhow::Result<Vec<Outbound>> {
         let mut out = Vec::new();
         let reply_to = from.unwrap_or(leader_id);
@@ -1066,6 +1119,7 @@ impl RaftCore {
                     match_index: 0,
                     conflict_index: self.persistent.log.last_index(),
                     need_snapshot: false,
+                    read_ctx,
                 },
             });
             return Ok(out);
@@ -1087,6 +1141,7 @@ impl RaftCore {
                     conflict_index: self.persistent.log.last_index(),
                     need_snapshot: prev_log_index > self.persistent.log.last_index() + 1
                         || prev_log_index < self.persistent.log.snapshot_index,
+                    read_ctx,
                 },
             });
             return Ok(out);
@@ -1101,6 +1156,7 @@ impl RaftCore {
                     match_index: 0,
                     conflict_index: self.persistent.log.snapshot_index,
                     need_snapshot: true,
+                    read_ctx,
                 },
             });
             return Ok(out);
@@ -1120,6 +1176,7 @@ impl RaftCore {
                     match_index: 0,
                     conflict_index: conflict,
                     need_snapshot: false,
+                    read_ctx,
                 },
             });
             return Ok(out);
@@ -1168,11 +1225,14 @@ impl RaftCore {
                 match_index: last_new,
                 conflict_index: 0,
                 need_snapshot: false,
+                read_ctx,
             },
         });
         Ok(out)
     }
 
+    // Field list mirrors AppendEntriesResponse.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_ae_response(
         &mut self,
         from: Option<NodeId>,
@@ -1181,6 +1241,7 @@ impl RaftCore {
         match_index: LogIndex,
         conflict_index: LogIndex,
         need_snapshot: bool,
+        read_ctx: u64,
     ) -> anyhow::Result<Vec<Outbound>> {
         if term > self.persistent.current_term {
             self.become_follower(term, None);
@@ -1193,6 +1254,13 @@ impl RaftCore {
         let Some(peer) = from else {
             return Ok(vec![]);
         };
+        // Any same-term answer proves `peer` still follows us, but only an
+        // answer to the current read round may confirm a pending read.
+        if let Some(leader) = self.leader.as_mut() {
+            if read_ctx == leader.read_round {
+                leader.heartbeat_acks.insert(peer);
+            }
+        }
 
         if need_snapshot {
             self.clear_peer_pipeline(peer);
@@ -1238,13 +1306,12 @@ impl RaftCore {
             }]);
         }
 
-        // Acks only fill `contact`; they never re-arm the check-quorum timer.
-        // Re-arming here pushed each check one window past the last ack, so a
-        // leader cut off right after an ack survived one extra window.
-        let commit_before = self.volatile.commit_index;
         let mut out = self.try_commit();
         out.extend(self.check_read_index_ready());
-        if !out.is_empty() || self.volatile.commit_index != commit_before {
+        if self.quorum_contact() {
+            out.push(Outbound::ResetElectionTimer);
+        }
+        if !out.is_empty() {
             self.persist().await?;
         }
         // Resume this peer if the ack freed in-flight budget. try_commit may
@@ -1383,6 +1450,24 @@ impl RaftCore {
                 ]);
             }
         };
+        if incoming.index <= self.volatile.commit_index {
+            // Stale image (etcd `restore`): we already committed past it.
+            // Installing would roll the KV back. Ack so the leader advances
+            // match_index, but keep log, KV and config as they are.
+            return Ok(vec![
+                Outbound::ResetElectionTimer,
+                Outbound::Send {
+                    to: reply_to,
+                    msg: Message::InstallSnapshotResponse {
+                        term: self.persistent.current_term,
+                        success: true,
+                        last_included_index: incoming.index,
+                        next_offset,
+                        done: true,
+                    },
+                },
+            ]);
+        }
         self.kv.restore_full(blob.kv.clone(), blob.sessions.clone());
         self.persistent
             .log
@@ -1478,17 +1563,25 @@ impl RaftCore {
                 leader.next_index.insert(peer, last_included_index + 1);
             }
             leader.snap_offset.remove(&peer);
-            leader.heartbeat_acks.insert(peer);
             leader.contact.insert(peer);
         }
         let self_id = self.id;
         if let Some(leader) = self.leader.as_mut() {
-            leader.heartbeat_acks.insert(self_id);
             leader.contact.insert(self_id);
         }
         let mut out = self.try_commit();
+        out.extend(self.check_read_index_ready());
+        if self.quorum_contact() {
+            out.push(Outbound::ResetElectionTimer);
+        }
         out.extend(self.replicate_peer(peer, false));
         Ok(out)
+    }
+
+    fn quorum_contact(&self) -> bool {
+        self.leader
+            .as_ref()
+            .is_some_and(|l| has_config_quorum(&self.persistent.config, &l.contact))
     }
 
     async fn handle_timeout_now(
@@ -1662,22 +1755,17 @@ impl RaftCore {
                 }])
             }
             ClientRequest::Get { key } | ClientRequest::ReadIndex { key } => {
-                // Reset heartbeat acks and ping quorum.
+                // Raft thesis §6.4: open a fresh round so only acks to the
+                // heartbeats sent after this read arrived can confirm it.
                 if let Some(leader) = self.leader.as_mut() {
+                    leader.read_round = leader.read_round.wrapping_add(1);
                     leader.heartbeat_acks.clear();
                     leader.heartbeat_acks.insert(self.id);
                 }
                 let term = self.persistent.current_term;
                 let mut out = self.broadcast_append_entries();
-                // Single-node: immediately ready.
-                if has_config_quorum(
-                    &self.persistent.config,
-                    &self
-                        .leader
-                        .as_ref()
-                        .map(|l| l.heartbeat_acks.clone())
-                        .unwrap_or_default(),
-                ) {
+                // Single voter: our own ack is the quorum.
+                if self.read_index_ready() {
                     let value = self.kv.get(&key).cloned();
                     out.push(Outbound::ClientReply {
                         corr,
@@ -1998,11 +2086,20 @@ impl RaftCore {
         out
     }
 
-    fn check_read_index_ready(&mut self) -> Vec<Outbound> {
+    /// A read may be served once (1) this term's noop is committed, so the
+    /// commit index covers every entry committed by earlier leaders, and
+    /// (2) a config quorum answered the current read round.
+    fn read_index_ready(&self) -> bool {
         let Some(leader) = self.leader.as_ref() else {
-            return vec![];
+            return false;
         };
-        if !has_config_quorum(&self.persistent.config, &leader.heartbeat_acks) {
+        let term = self.persistent.current_term;
+        let noop_committed = self.persistent.log.term_at(self.volatile.commit_index) == Some(term);
+        noop_committed && has_config_quorum(&self.persistent.config, &leader.heartbeat_acks)
+    }
+
+    fn check_read_index_ready(&mut self) -> Vec<Outbound> {
+        if self.pending_reads.is_empty() || !self.read_index_ready() {
             return vec![];
         }
         let term = self.persistent.current_term;
