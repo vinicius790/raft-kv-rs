@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
-use tracing::{info, warn, Instrument};
+use tracing::{info, warn};
 
 use crate::raft::{Outbound, RaftCore, Role, TimingConfig};
 use crate::rpc::{ClientRequest, ClientResponse, LogIndex, Message, NodeId, NodeStatus};
@@ -66,32 +66,6 @@ enum NodeCmd {
 }
 
 impl NodeHandle {
-    /// Cheap handle sharing the command channel. It cannot shut the node down;
-    /// only the original handle owns shutdown.
-    pub fn client(&self) -> NodeHandle {
-        NodeHandle {
-            id: self.id,
-            addr: self.addr,
-            cmd_tx: self.cmd_tx.clone(),
-            shutdown_tx: Mutex::new(None),
-            join: Mutex::new(None),
-        }
-    }
-
-    /// Delete a key through the log (leader only; waits for commit).
-    pub async fn delete(&self, key: impl Into<String>) -> ClientResponse {
-        let (tx, rx) = oneshot::channel();
-        let _ = self
-            .cmd_tx
-            .send(NodeCmd::Client {
-                req: ClientRequest::Delete { key: key.into() },
-                resp: tx,
-            })
-            .await;
-        rx.await
-            .unwrap_or_else(|_| ClientResponse::err("node gone"))
-    }
-
     pub async fn put(&self, key: impl Into<String>, value: impl Into<String>) -> ClientResponse {
         let (tx, rx) = oneshot::channel();
         let _ = self
@@ -272,6 +246,14 @@ impl NodeHandle {
 
 /// Spawn a Raft node on `cfg.bind`. Returns a handle.
 pub async fn spawn_node(cfg: NodeConfig) -> anyhow::Result<NodeHandle> {
+    spawn_node_with(cfg, transport::Security::default()).await
+}
+
+/// Spawn a node whose peer transport uses `security` (e.g. mutual TLS).
+pub async fn spawn_node_with(
+    cfg: NodeConfig,
+    security: transport::Security,
+) -> anyhow::Result<NodeHandle> {
     let listener = TcpListener::bind(cfg.bind).await?;
     let addr = listener.local_addr()?;
     let learners = cfg.learners.clone();
@@ -285,7 +267,8 @@ pub async fn spawn_node(cfg: NodeConfig) -> anyhow::Result<NodeHandle> {
         cfg.id,
         PeerMap::new(cfg.peers.clone()),
         PoolConfig::default(),
-    );
+    )
+    .with_security(security.clone());
 
     let storage = Storage::open(&cfg.data_dir).await?;
     let mut core =
@@ -299,7 +282,9 @@ pub async fn spawn_node(cfg: NodeConfig) -> anyhow::Result<NodeHandle> {
 
     let id = cfg.id;
     let join = tokio::spawn(async move {
-        let accept = tokio::spawn(transport::accept_loop(listener, inbound_tx));
+        let accept = tokio::spawn(transport::accept_loop_secure(
+            listener, inbound_tx, security,
+        ));
         if let Err(e) = run_loop(core, peers, inbound_rx, cmd_rx, shutdown_rx).await {
             warn!(node = id, error = %e, "node loop exited with error");
         }
@@ -335,10 +320,6 @@ async fn run_loop(
     // Map corr → pending slot for inbound client replies
     let mut corr_replies: HashMap<u64, PendingPut> = HashMap::new();
 
-    // Oldest outstanding AppendEntries per peer, for the latency histogram.
-    let mut append_sent: HashMap<NodeId, tokio::time::Instant> = HashMap::new();
-    let mut last_published = tokio::time::Instant::now() - Duration::from_secs(1);
-
     info!(node = core.id, "raft node online");
 
     loop {
@@ -355,7 +336,6 @@ async fn run_loop(
             }
             _ = &mut heartbeat => {
                 let out = core.on_heartbeat_timeout().await?;
-                track_appends(&out, &mut append_sent);
                 apply_outbound(&mut core, &peers, out, &mut election, &mut heartbeat, &mut pending, &mut corr_replies).await;
                 flush_pending_commits(&core, &mut pending, &mut corr_replies).await;
                 core.maybe_auto_snapshot().await?;
@@ -376,20 +356,7 @@ async fn run_loop(
                         append_term: 0,
                     });
                 }
-                if let (Some(from), Message::AppendEntriesResponse { .. }) = (inbound.from, &inbound.msg) {
-                    if let Some(t0) = append_sent.remove(&from) {
-                        crate::telemetry::record_append_latency(core.id, from, t0.elapsed());
-                    }
-                }
-                let span = tracing::debug_span!(
-                    "rpc",
-                    node = core.id,
-                    kind = msg_kind(&inbound.msg),
-                    peer = ?inbound.from,
-                    term = core.persistent.current_term
-                );
-                let out = core.handle_message(inbound.from, inbound.msg, corr).instrument(span).await?;
-                track_appends(&out, &mut append_sent);
+                let out = core.handle_message(inbound.from, inbound.msg, corr).await?;
                 apply_outbound(&mut core, &peers, out, &mut election, &mut heartbeat, &mut pending, &mut corr_replies).await;
                 flush_pending_commits(&core, &mut pending, &mut corr_replies).await;
                 core.maybe_auto_snapshot().await?;
@@ -407,6 +374,50 @@ async fn run_loop(
                         core.reload_peer_addrs(map);
                         peers.reload(new_peers).await;
                     }
+                    NodeCmd::Client { req: ClientRequest::Put { key, value }, resp } => {
+                        // Fold every Put already queued into one proposal.
+                        let mut batch = Vec::new();
+                        let mut bytes = 0usize;
+                        let mut carry = None;
+                        let mut next = Some((key, value, resp));
+                        while let Some((key, value, resp)) = next.take() {
+                            bytes += key.len() + value.len();
+                            let corr = corr_gen.fetch_add(1, Ordering::Relaxed);
+                            corr_replies.insert(corr, PendingPut {
+                                corr,
+                                wait_index: 0,
+                                reply: None,
+                                oneshot: Some(resp),
+                                read_key: None,
+                                read_term: 0,
+                                append_term: 0,
+                            });
+                            batch.push((corr, key, value));
+                            if batch.len() >= core.max_client_batch.max(1)
+                                || bytes >= core.max_client_batch_bytes
+                            {
+                                break;
+                            }
+                            match cmd_rx.try_recv() {
+                                Ok(NodeCmd::Client { req: ClientRequest::Put { key, value }, resp }) => {
+                                    next = Some((key, value, resp));
+                                }
+                                Ok(other) => carry = Some(other),
+                                Err(_) => {}
+                            }
+                        }
+                        let out = core.handle_put_batch(batch).await?;
+                        apply_outbound(&mut core, &peers, out, &mut election, &mut heartbeat, &mut pending, &mut corr_replies).await;
+                        core.maybe_auto_snapshot().await?;
+                        flush_pending_commits(&core, &mut pending, &mut corr_replies).await;
+                        if let Some(cmd) = carry {
+                            // Keep FIFO order: run the command that ended the batch now.
+                            let out = run_cmd(&mut core, cmd, &corr_gen, &mut corr_replies, &peers).await?;
+                            apply_outbound(&mut core, &peers, out, &mut election, &mut heartbeat, &mut pending, &mut corr_replies).await;
+                            core.maybe_auto_snapshot().await?;
+                            flush_pending_commits(&core, &mut pending, &mut corr_replies).await;
+                        }
+                    }
                     NodeCmd::Client { req, resp } => {
                         let corr = corr_gen.fetch_add(1, Ordering::Relaxed);
                         corr_replies.insert(corr, PendingPut {
@@ -419,7 +430,6 @@ async fn run_loop(
                             append_term: 0,
                         });
                         let out = core.handle_message(None, Message::Client(req), corr).await?;
-                        track_appends(&out, &mut append_sent);
                         apply_outbound(&mut core, &peers, out, &mut election, &mut heartbeat, &mut pending, &mut corr_replies).await;
                         flush_pending_commits(&core, &mut pending, &mut corr_replies).await;
                         core.maybe_auto_snapshot().await?;
@@ -427,39 +437,52 @@ async fn run_loop(
                 }
             }
         }
-        if last_published.elapsed() >= Duration::from_millis(50) {
-            crate::telemetry::record_snapshot(&core.metrics());
-            last_published = tokio::time::Instant::now();
-        }
     }
     Ok(())
 }
 
-fn track_appends(out: &[Outbound], sent: &mut HashMap<NodeId, tokio::time::Instant>) {
-    for ob in out {
-        if let Outbound::Send {
-            to,
-            msg: Message::AppendEntries { .. },
-        } = ob
-        {
-            sent.entry(*to).or_insert_with(tokio::time::Instant::now);
+/// Run one non-batched command; returns the core's outbound actions.
+async fn run_cmd(
+    core: &mut RaftCore,
+    cmd: NodeCmd,
+    corr_gen: &AtomicU64,
+    corr_replies: &mut HashMap<u64, PendingPut>,
+    peers: &PeerPool,
+) -> anyhow::Result<Vec<Outbound>> {
+    match cmd {
+        NodeCmd::Status { resp } => {
+            let _ = resp.send(core.status());
+            Ok(vec![])
         }
-    }
-}
-
-fn msg_kind(m: &Message) -> &'static str {
-    match m {
-        Message::RequestVote { .. } => "request_vote",
-        Message::RequestVoteResponse { .. } => "request_vote_resp",
-        Message::PreVote { .. } => "pre_vote",
-        Message::PreVoteResponse { .. } => "pre_vote_resp",
-        Message::AppendEntries { .. } => "append_entries",
-        Message::AppendEntriesResponse { .. } => "append_entries_resp",
-        Message::InstallSnapshot { .. } => "install_snapshot",
-        Message::InstallSnapshotResponse { .. } => "install_snapshot_resp",
-        Message::TimeoutNow { .. } => "timeout_now",
-        Message::Client(_) => "client",
-        _ => "admin",
+        NodeCmd::Metrics { resp } => {
+            let _ = resp.send(core.metrics());
+            Ok(vec![])
+        }
+        NodeCmd::ReloadPeers { peers: new_peers } => {
+            let map = new_peers
+                .iter()
+                .map(|(id, addr)| (*id, addr.to_string()))
+                .collect();
+            core.reload_peer_addrs(map);
+            peers.reload(new_peers).await;
+            Ok(vec![])
+        }
+        NodeCmd::Client { req, resp } => {
+            let corr = corr_gen.fetch_add(1, Ordering::Relaxed);
+            corr_replies.insert(
+                corr,
+                PendingPut {
+                    corr,
+                    wait_index: 0,
+                    reply: None,
+                    oneshot: Some(resp),
+                    read_key: None,
+                    read_term: 0,
+                    append_term: 0,
+                },
+            );
+            core.handle_message(None, Message::Client(req), corr).await
+        }
     }
 }
 
