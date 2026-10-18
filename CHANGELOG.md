@@ -2,6 +2,12 @@
 
 O formato segue o espírito de Keep a Changelog: versão, data, o que entrou e o que continua de fora. Não há seção de desempenho.
 
+## Não lançado
+
+### Corrigido
+
+- Transferência de liderança falhava com 5+ voters: o alvo fazia pre-vote e os followers que ainda ouviam o líder antigo recusavam. Agora `TimeoutNow` faz eleição direta, sem pre-vote (modelo do etcd); o voto continua exigindo log em dia. Testes: `timeout_now_transfers_leadership_in_five_node_cluster`, `timeout_now_campaigns_without_pre_vote_and_ignores_stale_term`.
+
 ## 1000000.0.0 — 2026-10-03
 
 O número **1000000.0.0** foi pedido explicitamente. Não declara maturidade de produção, não aproxima este crate de etcd e não congela uma API nova de disco. O layout de `raft-state.bin` continua a versão 1.

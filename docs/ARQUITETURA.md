@@ -63,7 +63,7 @@ Acrescentados em 1.1.0, no mesmo enum:
 - **Snapshot.** `compact_log` aplica até `commitIndex`, grava KV + sessões + config e corta o prefixo. Se `nextIndex` do peer cai no snapshot, o líder manda `InstallSnapshot` em fatias. O follower só trunca o log quando `done` é verdadeiro.
 - **Membership.** Uma mudança por vez: `C_old,new` (maioria dos dois lados) e, depois do commit, o líder anexa `C_new`. Learners recebem log e não votam.
 - **Read index.** `Get` espera quorum de acks de heartbeat no termo atual. `RawGet` não espera. Não há lease de leitura: o caminho linearizável é o read index.
-- **TimeoutNow.** O líder só envia depois de `matchIndex >= lastLogIndex` e então desce. O alvo faz pre-vote; pre-vote perdido não sobe o termo.
+- **TimeoutNow.** O líder só envia depois de `matchIndex >= lastLogIndex` e então desce. O alvo faz eleição direta, sem pre-vote, para não ser barrado pelos followers que ainda ouvem o líder antigo.
 - **Sessão.** `SessionPut` com `client_id` + `serial`. Na 1.1 o líder também recusa um segundo append se o mesmo par já está no log e ainda não commitou. `client_id == 0` é recusado. `SessionClient` guarda o serial do retry.
 
 ## O que a 1.1 acrescenta no processo
