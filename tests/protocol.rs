@@ -1,11 +1,11 @@
 //! Protocol tests for joint consensus, snapshots, pre-vote, transfer,
 //! read-index, learners, batching, sessions, metrics, and the simulator.
 
-use raft_mvp::raft::{ClusterConfig, Membership, Outbound, RaftCore, Role, TimingConfig};
-use raft_mvp::rpc::{ClientRequest, Message, SnapshotBlob};
-use raft_mvp::sim::{self, Sim};
-use raft_mvp::storage::Storage;
-use raft_mvp::Command;
+use raft_kv_rs::raft::{ClusterConfig, Membership, Outbound, RaftCore, Role, TimingConfig};
+use raft_kv_rs::rpc::{ClientRequest, Message, SnapshotBlob};
+use raft_kv_rs::sim::{self, Sim};
+use raft_kv_rs::storage::Storage;
+use raft_kv_rs::Command;
 
 fn timing() -> TimingConfig {
     TimingConfig {
@@ -105,6 +105,7 @@ async fn joint_change_does_not_commit_without_overlapping_quorum() {
                     match_index: joint_idx,
                     conflict_index: 0,
                     need_snapshot: false,
+                    read_ctx: 0,
                 },
                 0,
             )
@@ -126,6 +127,7 @@ async fn joint_change_does_not_commit_without_overlapping_quorum() {
                 match_index: joint_idx,
                 conflict_index: 0,
                 need_snapshot: false,
+                read_ctx: 0,
             },
             0,
         )
@@ -362,6 +364,7 @@ async fn leadership_transfer_keeps_committed_prefix() {
                 match_index: match_idx,
                 conflict_index: 0,
                 need_snapshot: false,
+                read_ctx: 0,
             },
             0,
         )
@@ -476,6 +479,7 @@ async fn stale_leader_does_not_serve_read_index() {
                     match_index: idx,
                     conflict_index: 0,
                     need_snapshot: false,
+                    read_ctx: 0,
                 },
                 0,
             )
@@ -500,7 +504,8 @@ async fn stale_leader_does_not_serve_read_index() {
         "partitioned leader must not answer a linearizable read, got {out:?}"
     );
     assert!(leader.pending_reads.iter().any(|r| r.0 == 42));
-    // Quorum heartbeat from one follower unblocks the read.
+    // Quorum heartbeat from one follower, answering the round opened by the read.
+    let round = leader.leader.as_ref().unwrap().read_round;
     let ready = leader
         .handle_message(
             Some(2),
@@ -510,6 +515,7 @@ async fn stale_leader_does_not_serve_read_index() {
                 match_index: leader.last_log_index(),
                 conflict_index: 0,
                 need_snapshot: false,
+                read_ctx: round,
             },
             0,
         )
@@ -577,6 +583,7 @@ async fn learner_cannot_elect_or_decide_commit_then_promotes() {
                 match_index: idx,
                 conflict_index: 0,
                 need_snapshot: false,
+                read_ctx: 0,
             },
             0,
         )
@@ -613,6 +620,7 @@ async fn learner_cannot_elect_or_decide_commit_then_promotes() {
                     match_index: joint_idx,
                     conflict_index: 0,
                     need_snapshot: false,
+                    read_ctx: 0,
                 },
                 0,
             )
@@ -671,7 +679,7 @@ async fn batch_append_entries_and_gap_rejected() {
                 leader_id: 1,
                 prev_log_index: 5,
                 prev_log_term: 1,
-                entries: vec![raft_mvp::LogEntry {
+                entries: vec![raft_kv_rs::LogEntry {
                     term: 1,
                     command: Command::Put {
                         key: "g".into(),
@@ -679,6 +687,7 @@ async fn batch_append_entries_and_gap_rejected() {
                     },
                 }],
                 leader_commit: 0,
+                read_ctx: 0,
             },
             0,
         )
@@ -754,6 +763,7 @@ async fn metrics_report_term_commit_and_lag() {
                 match_index: last.saturating_sub(1),
                 conflict_index: 0,
                 need_snapshot: false,
+                read_ctx: 0,
             },
             0,
         )
@@ -871,7 +881,7 @@ async fn chunk_gap_rejected_and_three_chunks_catch_up() {
 
     // Gap: a follower with a local entry must not truncate on a non-contiguous chunk.
     let (_dg, mut gapped) = fresh(3, vec![1]).await;
-    gapped.persistent.log.append(raft_mvp::LogEntry {
+    gapped.persistent.log.append(raft_kv_rs::LogEntry {
         term: 1,
         command: Command::Put {
             key: "keep".into(),
@@ -1131,6 +1141,7 @@ async fn flow_control_pauses_until_ack() {
                 match_index: 1,
                 conflict_index: 0,
                 need_snapshot: false,
+                read_ctx: 0,
             },
             0,
         )
@@ -1211,6 +1222,7 @@ async fn second_membership_change_waits_until_first_commits() {
                 match_index: joint_idx,
                 conflict_index: 0,
                 need_snapshot: false,
+                read_ctx: 0,
             },
             0,
         )
@@ -1245,6 +1257,7 @@ async fn second_membership_change_waits_until_first_commits() {
                 match_index: cnew,
                 conflict_index: 0,
                 need_snapshot: false,
+                read_ctx: 0,
             },
             0,
         )
@@ -1297,6 +1310,7 @@ async fn default_get_blocked_on_partitioned_leader() {
                     match_index: idx,
                     conflict_index: 0,
                     need_snapshot: false,
+                    read_ctx: 0,
                 },
                 0,
             )
@@ -1392,4 +1406,336 @@ async fn simulator_packet_loss_membership_change() {
     assert_eq!(ran.last().copied(), Some(80));
     assert_eq!(ran.len(), 40, "ran membership-loss seeds {ran:?}");
     eprintln!("membership-loss seeds ran: {ran:?}");
+}
+
+fn served_value(out: &[Outbound], corr: u64) -> Option<Option<String>> {
+    out.iter().find_map(|o| match o {
+        Outbound::ClientReply { corr: c, resp } if *c == corr && resp.ok => {
+            Some(resp.value.clone())
+        }
+        _ => None,
+    })
+}
+
+/// Regression (thesis §6.4): a new leader whose commit index lags must not
+/// serve a read before its own term's noop commits.
+#[tokio::test]
+async fn read_index_waits_for_noop_of_current_term() {
+    let (_d, mut n) = fresh(1, vec![2, 3]).await;
+    n.enable_pre_vote = false;
+    // Template entry with the crate's LogEntry type: elect a throwaway leader.
+    let (_t, tmpl) = elect_leader(vec![2]).await;
+    let put = |v: &str| {
+        let mut e = tmpl.persistent.log.entry(1).cloned().unwrap();
+        e.term = 1;
+        e.command = Command::Put {
+            key: "x".into(),
+            value: v.into(),
+        };
+        e
+    };
+    let (e1, e2) = (put("1"), put("2"));
+    // Term-1 leader 2 replicated x=1 and x=2; node 1 only learned commit of index 1.
+    n.handle_message(
+        Some(2),
+        Message::AppendEntries {
+            term: 1,
+            leader_id: 2,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![e1, e2],
+            leader_commit: 1,
+            read_ctx: 0,
+        },
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(n.kv.get("x").map(String::as_str), Some("1"));
+    n.on_election_timeout().await.unwrap();
+    let term = n.persistent.current_term;
+    for p in [2, 3] {
+        n.handle_message(
+            Some(p),
+            Message::RequestVoteResponse {
+                term,
+                vote_granted: true,
+            },
+            0,
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(n.volatile.role, Role::Leader);
+    let noop = n.last_log_index();
+    let out = n
+        .handle_message(
+            None,
+            Message::Client(ClientRequest::Get { key: "x".into() }),
+            9,
+        )
+        .await
+        .unwrap();
+    assert_eq!(served_value(&out, 9), None);
+    let round = n.leader.as_ref().unwrap().read_round;
+    // Both peers answer this round but have not stored the noop yet.
+    let mut all = Vec::new();
+    for p in [2, 3] {
+        all.extend(
+            n.handle_message(
+                Some(p),
+                Message::AppendEntriesResponse {
+                    term,
+                    success: true,
+                    match_index: noop - 1,
+                    conflict_index: 0,
+                    need_snapshot: false,
+                    read_ctx: round,
+                },
+                0,
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    assert_eq!(
+        served_value(&all, 9),
+        None,
+        "read served before this term's noop committed: {all:?}"
+    );
+    // Noop reaches a quorum: commit covers x=2 and the read returns it.
+    let out = n
+        .handle_message(
+            Some(2),
+            Message::AppendEntriesResponse {
+                term,
+                success: true,
+                match_index: noop,
+                conflict_index: 0,
+                need_snapshot: false,
+                read_ctx: round,
+            },
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(served_value(&out, 9), Some(Some("2".to_string())));
+}
+
+/// Regression: an ack to a heartbeat sent before the read arrived does not
+/// prove leadership for that read. Only the current round counts.
+#[tokio::test]
+async fn read_index_ignores_acks_from_earlier_round() {
+    let (_d, mut leader) = elect_leader(vec![2, 3]).await;
+    let term = leader.persistent.current_term;
+    let li = leader.last_log_index();
+    let ack = |read_ctx| Message::AppendEntriesResponse {
+        term,
+        success: true,
+        match_index: li,
+        conflict_index: 0,
+        need_snapshot: false,
+        read_ctx,
+    };
+    for p in [2, 3] {
+        leader.handle_message(Some(p), ack(0), 0).await.unwrap();
+    }
+    assert_eq!(leader.commit_index(), li, "noop committed");
+    let before = leader.leader.as_ref().unwrap().read_round;
+    leader.on_heartbeat_timeout().await.unwrap();
+    let out = leader
+        .handle_message(
+            None,
+            Message::Client(ClientRequest::Get { key: "x".into() }),
+            11,
+        )
+        .await
+        .unwrap();
+    assert_eq!(served_value(&out, 11), None);
+    let round = leader.leader.as_ref().unwrap().read_round;
+    assert!(round > before);
+    let late = leader
+        .handle_message(Some(2), ack(before), 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        served_value(&late, 11),
+        None,
+        "stale-round ack confirmed a read: {late:?}"
+    );
+    let fresh_ack = leader.handle_message(Some(2), ack(round), 0).await.unwrap();
+    assert_eq!(served_value(&fresh_ack, 11), Some(None));
+}
+
+/// Deliver queued messages among `alive` nodes until quiet. Every message is
+/// produced by the cores themselves; nothing is hand-built.
+async fn pump(nodes: &mut [RaftCore], mut q: Vec<(u64, u64, Message)>, alive: &[u64]) {
+    let mut steps = 0;
+    while let Some((from, to, msg)) = q.pop() {
+        steps += 1;
+        assert!(steps < 10_000, "message storm");
+        if !alive.contains(&from) || !alive.contains(&to) {
+            continue;
+        }
+        let n = nodes.iter_mut().find(|n| n.id == to).unwrap();
+        let out = n.handle_message(Some(from), msg, 0).await.unwrap();
+        for (dst, m) in sends(&out) {
+            q.insert(0, (to, dst, m));
+        }
+    }
+}
+
+fn outbox(from: u64, out: &[Outbound]) -> Vec<(u64, u64, Message)> {
+    sends(out)
+        .into_iter()
+        .map(|(to, m)| (from, to, m))
+        .collect()
+}
+
+/// Regression, public API only (compiles on the old main): an ack that
+/// node 2 sent BEFORE a new leader was elected and committed x=2 reaches the
+/// old leader after a client read. Counting it served the stale x=1.
+#[tokio::test]
+async fn deposed_leader_does_not_serve_read_with_ack_sent_before_read() {
+    let mut nodes = Vec::new();
+    for id in 1..=3u64 {
+        let peers = (1..=3).filter(|p| *p != id).collect();
+        let mut n = RaftCore::open(id, peers, Storage::ephemeral(), timing())
+            .await
+            .unwrap();
+        n.enable_pre_vote = false;
+        nodes.push(n);
+    }
+    let all = [1u64, 2, 3];
+    let out = nodes[0].on_election_timeout().await.unwrap();
+    pump(&mut nodes, outbox(1, &out), &all).await;
+    assert_eq!(nodes[0].volatile.role, Role::Leader);
+    let put = |v: &str| {
+        Message::Client(ClientRequest::Put {
+            key: "x".into(),
+            value: v.into(),
+        })
+    };
+    let out = nodes[0].handle_message(None, put("1"), 1).await.unwrap();
+    pump(&mut nodes, outbox(1, &out), &all).await;
+    let out = nodes[0].on_heartbeat_timeout().await.unwrap();
+    pump(&mut nodes, outbox(1, &out), &all).await;
+    assert_eq!(nodes[1].kv.get("x").map(String::as_str), Some("1"));
+
+    // Leader 1 heartbeats; node 2 answers, but the answer is delayed.
+    let hb = nodes[0].on_heartbeat_timeout().await.unwrap();
+    let to2 = sends(&hb)
+        .into_iter()
+        .find(|(to, m)| *to == 2 && matches!(m, Message::AppendEntries { .. }))
+        .unwrap()
+        .1;
+    let r = nodes[1].handle_message(Some(1), to2, 0).await.unwrap();
+    let delayed = sends(&r)
+        .into_iter()
+        .find(|(to, m)| *to == 1 && matches!(m, Message::AppendEntriesResponse { .. }))
+        .unwrap()
+        .1;
+
+    // Node 1 is cut off. Node 3 wins term 2 with node 2 and commits x=2.
+    let rest = [2u64, 3];
+    let out = nodes[2].on_election_timeout().await.unwrap();
+    pump(&mut nodes, outbox(3, &out), &rest).await;
+    assert_eq!(nodes[2].volatile.role, Role::Leader);
+    let out = nodes[2].handle_message(None, put("2"), 1).await.unwrap();
+    pump(&mut nodes, outbox(3, &out), &rest).await;
+    let out = nodes[2].on_heartbeat_timeout().await.unwrap();
+    pump(&mut nodes, outbox(3, &out), &rest).await;
+    assert_eq!(nodes[2].kv.get("x").map(String::as_str), Some("2"));
+
+    // The write completed. Now a client reads on the deposed leader 1.
+    assert_eq!(nodes[0].volatile.role, Role::Leader, "1 has not noticed");
+    let out = nodes[0]
+        .handle_message(
+            None,
+            Message::Client(ClientRequest::Get { key: "x".into() }),
+            77,
+        )
+        .await
+        .unwrap();
+    let mut replies: Vec<Outbound> = out;
+    replies.extend(nodes[0].handle_message(Some(2), delayed, 0).await.unwrap());
+    let stale = replies
+        .iter()
+        .any(|o| matches!(o, Outbound::ClientReply { corr: 77, resp } if resp.ok));
+    assert!(
+        !stale,
+        "deposed leader served a read with an ack sent before the read: {replies:?}"
+    );
+}
+
+/// A read parked on the read-index quorum must be answered when the leader is
+/// deposed. Before the fix it stayed in `pending_reads` forever, so the node
+/// never replied and `NodeHandle::get` hung (CI on main hung in Test).
+#[tokio::test]
+async fn deposed_leader_answers_pending_read_instead_of_hanging() {
+    let (_d, mut leader) = elect_leader(vec![2, 3]).await;
+    assert_eq!(leader.volatile.role, Role::Leader);
+    let out = leader
+        .handle_message(
+            None,
+            Message::Client(ClientRequest::Get { key: "x".into() }),
+            9,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !out.iter()
+            .any(|o| matches!(o, Outbound::ClientReply { corr: 9, .. })),
+        "read must wait for the quorum round"
+    );
+    let term = leader.persistent.current_term + 1;
+    let out = leader
+        .handle_message(
+            Some(2),
+            Message::AppendEntries {
+                term,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+                read_ctx: 0,
+            },
+            0,
+        )
+        .await
+        .unwrap();
+    assert_ne!(leader.volatile.role, Role::Leader);
+    let reply = out.iter().find_map(|o| match o {
+        Outbound::ClientReply { corr: 9, resp } => Some(resp.clone()),
+        _ => None,
+    });
+    let reply = reply.expect("pending read left unanswered after step-down");
+    assert!(!reply.ok);
+    assert_eq!(reply.leader_hint, Some(2));
+    assert!(leader.pending_reads.is_empty());
+
+    // Check-quorum step-down (election timer as leader) also answers.
+    let (_d2, mut l2) = elect_leader(vec![2, 3]).await;
+    l2.enable_check_quorum = true;
+    l2.handle_message(
+        None,
+        Message::Client(ClientRequest::Get { key: "x".into() }),
+        7,
+    )
+    .await
+    .unwrap();
+    let mut answered = false;
+    for _ in 0..3 {
+        let out = l2.on_election_timeout().await.unwrap();
+        answered |= out
+            .iter()
+            .any(|o| matches!(o, Outbound::ClientReply { corr: 7, resp } if !resp.ok));
+        if l2.volatile.role != Role::Leader {
+            break;
+        }
+    }
+    if l2.volatile.role != Role::Leader {
+        assert!(answered, "check-quorum step-down left the read unanswered");
+    }
 }
