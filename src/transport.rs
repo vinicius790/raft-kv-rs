@@ -52,7 +52,7 @@ pub async fn read_frame(stream: &mut TcpStream) -> std::io::Result<Message> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 16 * 1024 * 1024 {
+    if len > rpc::MAX_FRAME {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "frame too large",
@@ -144,7 +144,7 @@ async fn handle_connection(
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 16 * 1024 * 1024 {
+    if len > rpc::MAX_FRAME {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "frame too large",
