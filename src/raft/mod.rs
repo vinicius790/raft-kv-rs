@@ -106,6 +106,10 @@ pub struct RaftCore {
     snap_cache: Option<SnapImage>,
     /// Follower-side assembly of a chunked snapshot. Log is untouched until done.
     snap_in: Option<IncomingSnap>,
+    /// Committed config at `snapshot_index` (bootstrap config if none). The
+    /// effective config is this plus every ChangeConfig left in the log. It is
+    /// what goes into the `config` field of raft-state.bin.
+    config_base: ClusterConfig,
     /// Volatile counters. Reset on process start; not written to disk.
     pub commits: u64,
     pub elections: u64,
@@ -155,6 +159,7 @@ impl RaftCore {
         if persistent.config.is_uninitialized() {
             persistent.config = ClusterConfig::bootstrap(id, &peers, &learners);
         }
+        let config_base = persistent.config.clone();
         let commit_index = storage.commit_index();
         let (snap_idx, snap_term, snap_kv, snap_sess) = storage.snapshot_meta();
         let mut kv = KvStore::new();
@@ -219,6 +224,7 @@ impl RaftCore {
             snapshot_chunk_size: 1 << 20,
             snap_cache: None,
             snap_in: None,
+            config_base,
             commits: 0,
             elections: 0,
             snapshot_bytes: 0,
@@ -309,18 +315,27 @@ impl RaftCore {
         self.peer_addrs = addrs;
     }
 
+    /// Disk keeps the base config; the log suffix rebuilds the effective one.
     async fn persist(&mut self) -> anyhow::Result<()> {
-        self.storage
+        let effective = std::mem::replace(&mut self.persistent.config, self.config_base.clone());
+        let res = self
+            .storage
             .save(&self.persistent, self.volatile.commit_index)
-            .await?;
+            .await;
+        self.persistent.config = effective;
+        res?;
         Ok(())
     }
 
     /// Persist vote/term first then log (for crash-between-writes tests).
     pub async fn persist_vote_then_log(&mut self) -> anyhow::Result<()> {
-        self.storage
+        let effective = std::mem::replace(&mut self.persistent.config, self.config_base.clone());
+        let res = self
+            .storage
             .save_vote_then_log(&self.persistent, self.volatile.commit_index)
-            .await?;
+            .await;
+        self.persistent.config = effective;
+        res?;
         Ok(())
     }
 
@@ -686,12 +701,12 @@ impl RaftCore {
                 };
             }
         }
-        let blob = SnapshotBlob {
-            kv: self.kv.snapshot(),
-            sessions: self.kv.sessions_snapshot(),
-        };
+        // The image must be the state at `index`, not the live KV, which may
+        // already include entries after it. The durable snapshot is exactly that.
+        let (_, _, kv, sessions) = self.storage.snapshot_meta();
+        let blob = SnapshotBlob { kv, sessions };
         let data = bincode::serialize(&blob).unwrap_or_default();
-        let config = self.persistent.config.clone();
+        let config = self.config_base.clone();
         self.snap_cache = Some(SnapImage {
             index,
             term,
@@ -1127,13 +1142,9 @@ impl RaftCore {
 
         if !entries.is_empty() {
             self.persistent.log.append_entries(prev_log_index, &entries);
-            // Pick up config from any ChangeConfig in new entries.
-            for e in &entries {
-                if let Command::ChangeConfig(cfg) = &e.command {
-                    self.persistent.config = cfg.clone();
-                    self.refresh_role_from_config();
-                }
-            }
+            // Conflicting entries may have been truncated, ChangeConfig included:
+            // rebuild from the base, not from the config we had before.
+            self.recompute_config();
             self.persist().await?;
         }
 
@@ -1386,8 +1397,8 @@ impl RaftCore {
         self.persistent
             .log
             .install_snapshot(incoming.index, incoming.term);
-        self.persistent.config = incoming.config.clone();
-        self.refresh_role_from_config();
+        self.config_base = incoming.config.clone();
+        self.recompute_config();
         self.snapshot_index = incoming.index;
         self.snapshot_term = incoming.term;
         self.snap_cache = None;
@@ -1552,7 +1563,7 @@ impl RaftCore {
         }
         // Committed entries can be older than an uncommitted C_new already
         // stored in the log. The latest config entry wins, committed or not.
-        self.adopt_latest_config_from_log();
+        self.recompute_config();
         // Leader: if joint config committed, append C_new to leave joint.
         if self.volatile.role == Role::Leader {
             if let ClusterConfig::Joint { new, .. } = self.persistent.config.clone() {
@@ -1585,21 +1596,24 @@ impl RaftCore {
         }
     }
 
-    /// Latest ChangeConfig in the log, including entries that are not committed yet.
-    fn adopt_latest_config_from_log(&mut self) {
-        let last = self.persistent.log.last_index();
-        let mut found = None;
-        for i in 1..=last {
-            if let Some(e) = self.persistent.log.entry(i) {
-                if let Command::ChangeConfig(cfg) = &e.command {
-                    found = Some(cfg.clone());
-                }
+    /// Config in force after `index`: the base plus ChangeConfig entries in
+    /// `(snapshot_index, index]`.
+    fn config_at(&self, index: LogIndex) -> ClusterConfig {
+        let mut cfg = self.config_base.clone();
+        for i in self.persistent.log.first_index()..=index {
+            if let Some(Command::ChangeConfig(c)) = self.persistent.log.entry(i).map(|e| &e.command)
+            {
+                cfg = c.clone();
             }
         }
-        if let Some(cfg) = found {
-            self.persistent.config = cfg;
-            self.refresh_role_from_config();
-        }
+        cfg
+    }
+
+    /// Effective config: latest ChangeConfig in the log, committed or not,
+    /// falling back to the base config when the log suffix has none.
+    fn recompute_config(&mut self) {
+        self.persistent.config = self.config_at(self.persistent.log.last_index());
+        self.refresh_role_from_config();
     }
 
     fn try_leave_joint(&mut self) -> bool {
@@ -2041,9 +2055,11 @@ impl RaftCore {
         self.pending_reads.push((corr, key, read_term));
     }
 
-    /// Create a local snapshot compacting the log prefix through commit_index.
+    /// Create a local snapshot compacting the log prefix through
+    /// `min(retain_index, last_applied)`. Only applied (so committed) state and
+    /// the config committed at that index are written.
     pub async fn compact_log(&mut self, retain_index: LogIndex) -> anyhow::Result<()> {
-        let last_included = retain_index.min(self.volatile.commit_index);
+        let last_included = retain_index.min(self.volatile.last_applied);
         if last_included == 0 || last_included <= self.persistent.log.snapshot_index {
             return Ok(());
         }
@@ -2052,20 +2068,12 @@ impl RaftCore {
             .log
             .term_at(last_included)
             .unwrap_or(self.persistent.current_term);
-        // Ensure KV reflects applied state through last_included.
-        while self.volatile.last_applied < last_included.min(self.volatile.commit_index) {
-            self.volatile.last_applied += 1;
-            if let Some(e) = self.persistent.log.entry(self.volatile.last_applied) {
-                self.kv.apply(&e.command);
-            }
-        }
+        let image = self.kv_image_at(last_included);
+        let base = self.config_at(last_included);
         self.persistent.log.compact_through(last_included, term);
+        self.config_base = base;
         self.snapshot_index = last_included;
         self.snapshot_term = term;
-        let image = SnapshotBlob {
-            kv: self.kv.snapshot(),
-            sessions: self.kv.sessions_snapshot(),
-        };
         let image_bytes = bincode::serialized_size(&image).unwrap_or(0);
         self.snapshot_bytes = self.snapshot_bytes.saturating_add(image_bytes);
         self.snap_cache = None;
@@ -2078,13 +2086,35 @@ impl RaftCore {
                 image.sessions,
                 self.persistent.log.clone(),
                 self.volatile.commit_index,
-                self.persistent.config.clone(),
+                self.config_base.clone(),
                 self.persistent.current_term,
                 self.persistent.voted_for,
             )
             .await?;
         info!(node = self.id, last_included, "log compacted via snapshot");
         Ok(())
+    }
+
+    /// KV and sessions as of `index` (snapshot_index <= index <= last_applied).
+    fn kv_image_at(&self, index: LogIndex) -> SnapshotBlob {
+        if index == self.volatile.last_applied {
+            return SnapshotBlob {
+                kv: self.kv.snapshot(),
+                sessions: self.kv.sessions_snapshot(),
+            };
+        }
+        let (_, _, kv, sessions) = self.storage.snapshot_meta();
+        let mut img = KvStore::new();
+        img.restore_full(kv, sessions);
+        for i in self.persistent.log.first_index()..=index {
+            if let Some(e) = self.persistent.log.entry(i) {
+                img.apply(&e.command);
+            }
+        }
+        SnapshotBlob {
+            kv: img.snapshot(),
+            sessions: img.sessions_snapshot(),
+        }
     }
 
     /// Compact when the committed suffix since the last snapshot reaches
