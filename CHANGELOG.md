@@ -2,6 +2,12 @@
 
 O formato segue o espírito de Keep a Changelog: versão, data, o que entrou e o que continua de fora. Não há seção de desempenho.
 
+## Não lançado
+
+### Corrigido
+
+- CI: o `uses:` do `Swatinem/rust-cache` tinha um SHA de 39 caracteres, que não existe, e o job falhava antes de rodar fmt/clippy/test. Agora aponta para o commit completo da tag `v2.9.2` (`6323deb102c322ba6fcbdcafc7e3dddab59af2b6`, conferido com `git ls-remote`).
+
 ## 1000000.0.0 — 2026-10-03
 
 O número **1000000.0.0** foi pedido explicitamente. Não declara maturidade de produção, não aproxima este crate de etcd e não congela uma API nova de disco. O layout de `raft-state.bin` continua a versão 1.
