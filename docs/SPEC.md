@@ -1,4 +1,4 @@
-# Especificação — raft-mvp 1000000.0.0
+# Especificação — raft-kv-rs 1000000.0.0
 
 Implementação didática de Raft (Ongaro & Ousterhout) em Rust. Este documento descreve o que o código faz e o que **não** promete. Não há números de throughput, latência ou tempo de eleição inventados. Timeouts padrão estão em `TECNOLOGIAS.md`; testes de integração encurtam esses intervalos de propósito.
 
@@ -53,13 +53,13 @@ Papel `Learner`: recebe AppendEntries e InstallSnapshot, não vota, não inicia 
 
 `compact_log` aplica até `commitIndex`, grava KV + sessões + config, e apaga o prefixo do log. Se `nextIndex` do peer cai em ou antes do snapshot, o líder manda `InstallSnapshot` **em fatias**: `offset` é o byte inicial do pedaço, `done` marca o último. O follower junta os bytes e **só trunca o log quando `done` e o CRC-32 do buffer é o `checksum` anunciado** (CRC-32/ISO-HDLC da imagem inteira, o mesmo em cada fatia). Checksum divergente recusa sem truncar. Um pedaço cujo `offset` não continua o buffer (um buraco) é recusado; o log local permanece. `snapshot_chunk_size` (padrão 1 MiB) define o tamanho de cada fatia. Uma imagem que cabe numa fatia sai com `offset = 0` e `done = true`, como um único RPC.
 
-Ao instalar, o follower só mantém as entradas depois de `last_included_index` se a entrada nesse índice tiver o mesmo termo `last_included_term` (Raft, Fig. 13); senão descarta o log inteiro.
+Snapshot com `last_included_index <= commitIndex` do follower é velho: o follower responde `success`/`done` (o líder avança `matchIndex`) e **não** troca KV, log nem config, para o KV não voltar no tempo.
 
 O frame TCP continua com teto de 16 MiB. Uma fatia não deve passar desse teto.
 
 ## Read index
 
-`ClientRequest::Get` e `ClientRequest::ReadIndex` são o mesmo caminho: o líder zera os acks de heartbeat, conta a si mesmo e só responde quando `has_config_quorum` no **termo atual**. Sem essa maioria (líder particionado) a resposta fica pendente. `NodeHandle::get` e o subcomando `get` da CLI usam esse caminho.
+`ClientRequest::Get` e `ClientRequest::ReadIndex` são o mesmo caminho (tese do Raft, §6.4): o líder abre uma rodada nova (`read_round`), zera os acks, conta a si mesmo e manda `AppendEntries` com `read_ctx = read_round`. Só responde quando (1) o noop do termo atual já está commitado e (2) `has_config_quorum` sobre os peers que responderam **essa** rodada (o follower ecoa `read_ctx`). Ack de rodada anterior não conta. Sem essas duas condições (líder novo ou particionado) a resposta fica pendente. `NodeHandle::get` e o subcomando `get` da CLI usam esse caminho.
 
 `ClientRequest::RawGet` (e `NodeHandle::raw_get`) lê o estado já aplicado no líder **sem** read index. Não é linearizável.
 
