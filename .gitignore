@@ -1,0 +1,8 @@
+/target/
+**/*.rs.bk
+.DS_Store
+*.swp
+*.tmp
+/data/
+/tmp-raft*/
+raft-state.bin

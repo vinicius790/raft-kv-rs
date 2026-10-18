@@ -1,0 +1,34 @@
+[package]
+name = "raft-mvp"
+version = "1000000.0.0"
+edition = "2021"
+authors = ["Geraliza Castlevania <catalog@example.com>"]
+description = "Didactic Raft: joint membership, chunked snapshots with checksum, read index, check quorum, protocol trace, session client (tokio + TCP)"
+license = "MIT"
+readme = "README.md"
+keywords = ["raft", "consensus", "distributed", "tokio", "kv"]
+categories = ["network-programming", "database-implementations"]
+repository = "https://github.com/example/raft-mvp"
+
+[[bin]]
+name = "raft-node"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs", "signal"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+thiserror = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs", "test-util"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
