@@ -14,7 +14,7 @@ use tracing::{info, warn};
 use crate::raft::{Outbound, RaftCore, Role, TimingConfig};
 use crate::rpc::{ClientRequest, ClientResponse, LogIndex, Message, NodeId, NodeStatus};
 use crate::storage::Storage;
-use crate::transport::{self, Inbound, PeerMap};
+use crate::transport::{self, Inbound, PeerMap, PeerPool, PoolConfig};
 
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
@@ -253,7 +253,11 @@ pub async fn spawn_node(cfg: NodeConfig) -> anyhow::Result<NodeHandle> {
         .copied()
         .filter(|id| !learners.contains(id))
         .collect();
-    let peers = PeerMap::new(cfg.peers.clone());
+    let peers = PeerPool::new(
+        cfg.id,
+        PeerMap::new(cfg.peers.clone()),
+        PoolConfig::default(),
+    );
 
     let storage = Storage::open(&cfg.data_dir).await?;
     let mut core =
@@ -288,7 +292,7 @@ pub async fn spawn_node(cfg: NodeConfig) -> anyhow::Result<NodeHandle> {
 
 async fn run_loop(
     mut core: RaftCore,
-    peers: PeerMap,
+    peers: PeerPool,
     mut inbound_rx: mpsc::Receiver<Inbound>,
     mut cmd_rx: mpsc::Receiver<NodeCmd>,
     mut shutdown_rx: oneshot::Receiver<()>,
@@ -375,7 +379,7 @@ async fn run_loop(
 
 async fn apply_outbound(
     core: &mut RaftCore,
-    peers: &PeerMap,
+    peers: &PeerPool,
     out: Vec<Outbound>,
     election: &mut std::pin::Pin<&mut tokio::time::Sleep>,
     heartbeat: &mut std::pin::Pin<&mut tokio::time::Sleep>,
@@ -386,9 +390,8 @@ async fn apply_outbound(
         match ob {
             Outbound::Send { to, msg } => {
                 let peers = peers.clone();
-                let from = core.id;
                 tokio::spawn(async move {
-                    let _ = transport::send_peer_message(&peers, to, from, msg).await;
+                    let _ = peers.send(to, &msg).await;
                 });
             }
             Outbound::ClientReply { corr, resp } => {
