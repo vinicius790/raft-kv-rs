@@ -429,7 +429,7 @@ async fn run_cmd(
     cmd: NodeCmd,
     corr_gen: &AtomicU64,
     corr_replies: &mut HashMap<u64, PendingPut>,
-    peers: &PeerMap,
+    peers: &PeerPool,
 ) -> anyhow::Result<Vec<Outbound>> {
     match cmd {
         NodeCmd::Status { resp } => {

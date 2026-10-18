@@ -8,10 +8,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use raft_mvp::node::{spawn_node, NodeConfig};
-use raft_mvp::raft::TimingConfig;
-use raft_mvp::rpc::Message;
-use raft_mvp::transport::{self, PeerMap};
+use raft_kv_rs::node::{spawn_node, NodeConfig};
+use raft_kv_rs::raft::TimingConfig;
+use raft_kv_rs::rpc::Message;
+use raft_kv_rs::transport::{self, PeerMap};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 
@@ -52,6 +52,7 @@ async fn fake_peer(
                         term,
                         prev_log_index,
                         entries: e,
+                        read_ctx,
                         ..
                     } => {
                         if !e.is_empty() {
@@ -64,6 +65,7 @@ async fn fake_peer(
                             match_index: prev_log_index + e.len() as u64,
                             conflict_index: 0,
                             need_snapshot: false,
+                            read_ctx,
                         }
                     }
                     _ => continue,
