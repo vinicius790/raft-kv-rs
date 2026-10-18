@@ -57,7 +57,7 @@ Ao instalar, o follower só mantém as entradas depois de `last_included_index` 
 
 Snapshot com `last_included_index <= commitIndex` do follower é velho: o follower responde `success`/`done` (o líder avança `matchIndex`) e **não** troca KV, log nem config, para o KV não voltar no tempo.
 
-O frame TCP continua com teto de 16 MiB. Uma fatia não deve passar desse teto.
+O frame TCP continua com teto de 16 MiB (`transport::MAX_FRAME`), checado na leitura **e** na escrita: `Frame::write` devolve `InvalidData` em vez de mandar um frame que o outro lado recusaria. Uma fatia não deve passar desse teto.
 
 ## Read index
 
