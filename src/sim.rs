@@ -321,6 +321,173 @@ impl Sim {
     }
 }
 
+/// One step of a generated fault schedule (see [`check_schedule`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// Advance logical time.
+    Run(u64),
+    /// Set message drop rate (per mille, capped at 500).
+    Drop(u32),
+    /// Cut the link between two nodes in both directions.
+    Partition(NodeId, NodeId),
+    /// Remove every partition.
+    Heal,
+    /// Crash a node and reopen it from its durable state (volatile state lost).
+    Restart(NodeId),
+    /// Propose a put through whoever is leader now (ignored if none).
+    Put(u8),
+    /// Shrink to two voters, or grow back to three, via joint consensus.
+    ToggleMembership,
+}
+
+impl Sim {
+    /// Crash-restart: rebuild the core from what it persisted.
+    pub async fn restart(&mut self, id: NodeId) {
+        let Some(old) = self.nodes.get(&id) else {
+            return;
+        };
+        let storage = old.storage().clone();
+        let peers: Vec<NodeId> = self.nodes.keys().copied().filter(|p| *p != id).collect();
+        let timing = TimingConfig {
+            heartbeat_ms: 3,
+            election_min_ms: 10,
+            election_max_ms: 20,
+        };
+        if let Ok(core) = RaftCore::open(id, peers, storage, timing).await {
+            self.nodes.insert(id, core);
+        }
+        // Messages in flight to the crashed process are lost.
+        self.inbox.retain(|e| e.to != id);
+    }
+
+    /// Log matching + state machine safety across every pair of nodes:
+    /// if two logs hold an entry with the same index and term, all earlier
+    /// entries are equal; and committed prefixes never disagree.
+    pub fn check_log_invariants(&self) -> Result<(), String> {
+        let ids: Vec<NodeId> = self.nodes.keys().copied().collect();
+        for (i, &a) in ids.iter().enumerate() {
+            for &b in &ids[i + 1..] {
+                let la = &self.nodes[&a].persistent.log;
+                let lb = &self.nodes[&b].persistent.log;
+                let lo = la.first_index().max(lb.first_index());
+                let hi = la.last_index().min(lb.last_index());
+                // Highest index where both have the same term.
+                let mut matched = None;
+                for idx in (lo..=hi).rev() {
+                    if idx > 0 && la.term_at(idx).is_some() && la.term_at(idx) == lb.term_at(idx) {
+                        matched = Some(idx);
+                        break;
+                    }
+                }
+                if let Some(m) = matched {
+                    for idx in lo.max(1)..=m {
+                        if let (Some(ea), Some(eb)) = (la.entry(idx), lb.entry(idx)) {
+                            if ea != eb {
+                                return Err(format!(
+                                    "log matching broken between {a} and {b} at {idx} (match at {m})"
+                                ));
+                            }
+                        }
+                    }
+                }
+                let committed = self.commit_of(a).min(self.commit_of(b)).min(hi);
+                for idx in lo.max(1)..=committed {
+                    if let (Some(ea), Some(eb)) = (la.entry(idx), lb.entry(idx)) {
+                        if ea != eb {
+                            return Err(format!(
+                                "committed entry {idx} differs between {a} and {b}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Run a generated schedule on a fresh 3-node cluster and check, after every
+/// step: one leader per term, log matching, committed-prefix agreement and
+/// commit-index monotonicity (a restart may only fall back to the durable
+/// commit, never below what the cluster majority already committed).
+pub async fn check_schedule(seed: u64, steps: &[Step]) -> Result<(), String> {
+    let all = [1u64, 2, 3];
+    let mut sim = Sim::new(seed, &all).await;
+    let mut shrunk = false;
+    let mut cluster_commit = 0u64;
+    for (n, step) in steps.iter().enumerate() {
+        match step {
+            Step::Run(t) => sim.run((*t).min(60)).await,
+            Step::Drop(p) => sim.set_drop_permille((*p).min(500)),
+            Step::Partition(a, b) if a != b => sim.partition_pair(*a, *b),
+            Step::Partition(..) => {}
+            Step::Heal => sim.heal(),
+            Step::Restart(id) => sim.restart(*id).await,
+            Step::Put(k) => {
+                if let Some(l) = sim.leader_id() {
+                    let _ = sim
+                        .client(
+                            l,
+                            ClientRequest::Put {
+                                key: format!("k{k}"),
+                                value: format!("{seed}-{n}"),
+                            },
+                        )
+                        .await;
+                }
+            }
+            Step::ToggleMembership => {
+                if let Some(l) = sim.leader_id() {
+                    let voters = if shrunk {
+                        all.to_vec()
+                    } else {
+                        let other = all.iter().copied().find(|i| *i != l).unwrap();
+                        vec![l, other]
+                    };
+                    let resp = sim
+                        .client(
+                            l,
+                            ClientRequest::ChangeMembership {
+                                voters,
+                                learners: vec![],
+                            },
+                        )
+                        .await;
+                    if resp.map(|r| r.ok).unwrap_or(true) {
+                        shrunk = !shrunk;
+                    }
+                }
+            }
+        }
+        if !sim.safety_violations.is_empty() {
+            return Err(format!(
+                "seed {seed} step {n} {step:?}: {}",
+                sim.safety_violations.join("; ")
+            ));
+        }
+        sim.check_log_invariants()
+            .map_err(|e| format!("seed {seed} step {n} {step:?}: {e}"))?;
+        // Leader completeness: the current leader holds every entry the
+        // cluster ever committed.
+        if let Some(l) = sim.leader_id() {
+            let last = sim.nodes[&l].persistent.log.last_index();
+            if last < cluster_commit {
+                return Err(format!(
+                    "seed {seed} step {n}: leader {l} last index {last} < committed {cluster_commit}"
+                ));
+            }
+        }
+        let max_commit = sim
+            .nodes
+            .keys()
+            .map(|id| sim.commit_of(*id))
+            .max()
+            .unwrap_or(0);
+        cluster_commit = cluster_commit.max(max_commit);
+    }
+    Ok(())
+}
+
 /// Seeds actually exercised by the property test (reported, not invented).
 pub const PROPERTY_SEEDS: &[u64] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
