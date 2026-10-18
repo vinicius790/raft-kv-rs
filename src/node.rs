@@ -449,6 +449,36 @@ async fn apply_outbound(
             .as_mut()
             .reset(tokio::time::Instant::now() + Duration::from_secs(3600));
     }
+    rearm_fired_timers(core, election, heartbeat);
+}
+
+/// A tokio `Sleep` stays ready once it has fired. If the core did not ask for
+/// a reset (e.g. a heartbeat tick after stepping down returns nothing), the
+/// `select!` would take that branch on every iteration and spin a CPU core.
+fn rearm_fired_timers(
+    core: &RaftCore,
+    election: &mut std::pin::Pin<&mut tokio::time::Sleep>,
+    heartbeat: &mut std::pin::Pin<&mut tokio::time::Sleep>,
+) {
+    let now = tokio::time::Instant::now();
+    if heartbeat.is_elapsed() {
+        let next = if core.is_leader() {
+            core.heartbeat_interval()
+        } else {
+            Duration::from_secs(3600)
+        };
+        heartbeat.as_mut().reset(now + next);
+    }
+    if election.is_elapsed() {
+        let next = if core.is_leader() && core.enable_check_quorum {
+            core.check_quorum_timeout()
+        } else if core.is_leader() {
+            Duration::from_secs(3600)
+        } else {
+            core.random_election_timeout()
+        };
+        election.as_mut().reset(now + next);
+    }
 }
 
 async fn flush_pending_commits(
