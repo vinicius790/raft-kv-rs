@@ -24,11 +24,20 @@ clap = { version = "4", features = ["derive"] }
 rand = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
+rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"], optional = true }
+rustls-pki-types = { version = "1", features = ["std"], optional = true }
 
 [dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs", "test-util"] }
 
 [profile.release]
 lto = true
 codegen-units = 1
+
+[features]
+# Mutual TLS between nodes (rustls 0.23, ring provider).
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-webpki", "dep:rustls-pki-types"]
