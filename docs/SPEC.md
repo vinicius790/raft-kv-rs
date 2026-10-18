@@ -113,7 +113,7 @@ O crc é calculado no crate (`storage::crc32`). Não há dependência extra para
 
 ## Check-quorum (1.1)
 
-No líder TCP, `contact` inclui o próprio id e peers que ack de `AppendEntries` ou de `InstallSnapshot` com `done`. O conjunto do read index é outro e continua sendo zerado a cada `Get`.
+No líder TCP, `contact` inclui o próprio id e peers que ack de `AppendEntries` ou de `InstallSnapshot` com `done`. O conjunto do read index é outro e continua sendo zerado a cada `Get`. Ack **não** rearma o timer de check-quorum: a janela é fixa (`check_quorum_timeout`), rearmada só pela própria checagem. Assim um líder isolado logo depois de um ack desce na checagem seguinte, sem ganhar uma janela extra.
 
 Se `on_election_timeout` corre no líder e `contact` não forma quorum da config, o líder vira follower e **não** incrementa `currentTerm`. A janela armada pelo processo é `4 * election_max_ms`. Heartbeat sem ack não reinicia a janela; ack que completa o quorum reinicia. `enable_check_quorum = false` restaura o comportamento antigo (líder ignora o timeout).
 
