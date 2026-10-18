@@ -12,6 +12,8 @@ pub mod raft;
 pub mod rpc;
 pub mod sim;
 pub mod storage;
+#[cfg(feature = "tls")]
+pub mod tls;
 pub mod transport;
 
 pub use client::SessionClient;
