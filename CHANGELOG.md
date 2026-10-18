@@ -4,11 +4,6 @@ O formato segue o espírito de Keep a Changelog: versão, data, o que entrou e o
 
 ## Não lançado
 
-### Mudou
-
-- Crate renomeado de `raft-mvp` para `raft-kv-rs`, igual ao repositório. O binário continua `raft-node`. Quem importa a biblioteca troca `raft_mvp::` por `raft_kv_rs::`; o filtro de log padrão da CLI passa a ser `raft_kv_rs=info`.
-- `Cargo.toml`: `repository`/`homepage` apontam para https://github.com/vinicius790/raft-kv-rs e o e-mail placeholder saiu de `authors`.
-- Formato em disco (`raft-state.bin`, versão 1) e protocolo de rede não mudaram.
 ### Corrigido
 
 - CI: o `uses:` do `Swatinem/rust-cache` tinha um SHA de 39 caracteres, que não existe, e o job falhava antes de rodar fmt/clippy/test. Agora aponta para o commit completo da tag `v2.9.2` (`6323deb102c322ba6fcbdcafc7e3dddab59af2b6`, conferido com `git ls-remote`).
