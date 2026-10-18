@@ -7,10 +7,10 @@ use std::time::Duration;
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
-use raft_mvp::node::{spawn_node_with, NodeConfig};
-use raft_mvp::raft::TimingConfig;
-use raft_mvp::rpc::{ClientRequest, ClientResponse, Message, NodeId};
-use raft_mvp::transport;
+use raft_kv_rs::node::{spawn_node, NodeConfig};
+use raft_kv_rs::raft::TimingConfig;
+use raft_kv_rs::rpc::{ClientRequest, ClientResponse, Message, NodeId};
+use raft_kv_rs::transport;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -18,48 +18,6 @@ use tracing_subscriber::EnvFilter;
 struct Cli {
     #[command(subcommand)]
     cmd: Commands,
-    /// PEM certificate chain of this node (SANs: node-<id>, raft-kv). Feature `tls`.
-    #[cfg(feature = "tls")]
-    #[arg(long, global = true)]
-    tls_cert: Option<PathBuf>,
-    /// PEM private key matching --tls-cert.
-    #[cfg(feature = "tls")]
-    #[arg(long, global = true)]
-    tls_key: Option<PathBuf>,
-    /// PEM CA that signs every node certificate. Alone, enables TLS for CLI clients.
-    #[cfg(feature = "tls")]
-    #[arg(long, global = true)]
-    tls_ca: Option<PathBuf>,
-}
-
-fn security(cli: &Cli) -> anyhow::Result<transport::Security> {
-    #[cfg(feature = "tls")]
-    {
-        use raft_mvp::tls::TlsMaterial;
-        match (&cli.tls_cert, &cli.tls_key, &cli.tls_ca) {
-            (Some(c), Some(k), Some(ca)) => {
-                return Ok(transport::Security::tls(TlsMaterial::from_pem_files(
-                    c, k, ca,
-                )?))
-            }
-            (None, None, Some(ca)) => {
-                return Ok(transport::Security::tls(TlsMaterial::client_only(
-                    &std::fs::read(ca)?,
-                )?))
-            }
-            (None, None, None) => {}
-            _ => bail!("--tls-cert and --tls-key need --tls-ca (and each other)"),
-        }
-    }
-    let _ = cli;
-    Ok(transport::Security::plain())
-}
-
-static SECURITY: std::sync::OnceLock<transport::Security> = std::sync::OnceLock::new();
-
-async fn request(addr: SocketAddr, msg: Message, timeout: Duration) -> std::io::Result<Message> {
-    let sec = SECURITY.get().cloned().unwrap_or_default();
-    transport::client_request_secure(addr, msg, timeout, &sec).await
 }
 
 #[derive(Subcommand, Debug)]
@@ -76,11 +34,11 @@ enum Commands {
         peers: String,
         #[arg(long, default_value = "./data")]
         data_dir: PathBuf,
-        #[arg(long, default_value_t = raft_mvp::DEFAULT_HEARTBEAT_MS)]
+        #[arg(long, default_value_t = raft_kv_rs::DEFAULT_HEARTBEAT_MS)]
         heartbeat_ms: u64,
-        #[arg(long, default_value_t = raft_mvp::DEFAULT_ELECTION_MIN_MS)]
+        #[arg(long, default_value_t = raft_kv_rs::DEFAULT_ELECTION_MIN_MS)]
         election_min_ms: u64,
-        #[arg(long, default_value_t = raft_mvp::DEFAULT_ELECTION_MAX_MS)]
+        #[arg(long, default_value_t = raft_kv_rs::DEFAULT_ELECTION_MAX_MS)]
         election_max_ms: u64,
         /// Learners: id=addr,id=addr. Dialed like peers, but they do not vote.
         #[arg(long, default_value = "")]
@@ -156,12 +114,10 @@ enum Commands {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("raft_mvp=info".parse()?))
+        .with_env_filter(EnvFilter::from_default_env().add_directive("raft_kv_rs=info".parse()?))
         .init();
 
     let cli = Cli::parse();
-    let sec = security(&cli)?;
-    let _ = SECURITY.set(sec.clone());
     match cli.cmd {
         Commands::Serve {
             id,
@@ -191,7 +147,7 @@ async fn main() -> anyhow::Result<()> {
                 learners: learner_ids,
                 snapshot_threshold,
             };
-            let handle = spawn_node_with(cfg, sec).await?;
+            let handle = spawn_node(cfg).await?;
             tracing::info!(id, addr = %handle.addr, "serving");
             tokio::signal::ctrl_c().await?;
             handle.shutdown().await;
@@ -211,9 +167,10 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Status { addr } => {
-            let msg = request(addr, Message::StatusRequest, Duration::from_secs(3))
-                .await
-                .context("status request")?;
+            let msg =
+                transport::client_request(addr, Message::StatusRequest, Duration::from_secs(3))
+                    .await
+                    .context("status request")?;
             match msg {
                 Message::ClientReply(r) => {
                     println!("{}", r.value.unwrap_or_default());
@@ -238,9 +195,10 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Metrics { addr } => {
-            let msg = request(addr, Message::MetricsRequest, Duration::from_secs(3))
-                .await
-                .context("metrics request")?;
+            let msg =
+                transport::client_request(addr, Message::MetricsRequest, Duration::from_secs(3))
+                    .await
+                    .context("metrics request")?;
             match msg {
                 Message::ClientReply(r) => {
                     println!("{}", r.value.unwrap_or_default());
@@ -252,9 +210,10 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Trace { addr } => {
-            let msg = request(addr, Message::TraceRequest, Duration::from_secs(3))
-                .await
-                .context("trace request")?;
+            let msg =
+                transport::client_request(addr, Message::TraceRequest, Duration::from_secs(3))
+                    .await
+                    .context("trace request")?;
             match msg {
                 Message::ClientReply(r) => {
                     println!("{}", r.value.unwrap_or_default());
@@ -362,7 +321,7 @@ fn parse_peers(s: &str) -> anyhow::Result<HashMap<NodeId, SocketAddr>> {
 }
 
 async fn client_rpc(addr: SocketAddr, msg: Message) -> anyhow::Result<ClientResponse> {
-    let reply = request(addr, msg, Duration::from_secs(5)).await?;
+    let reply = transport::client_request(addr, msg, Duration::from_secs(5)).await?;
     match reply {
         Message::ClientReply(r) => Ok(r),
         other => bail!("unexpected reply: {other:?}"),
