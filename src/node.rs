@@ -36,6 +36,8 @@ struct PendingPut {
     oneshot: Option<oneshot::Sender<ClientResponse>>,
     read_key: Option<String>,
     read_term: u64,
+    /// Term in which the leader appended the entry at `wait_index`.
+    append_term: u64,
 }
 
 /// Handle to a running node (for tests and embedding).
@@ -331,6 +333,7 @@ async fn run_loop(
                         oneshot: None,
                         read_key: None,
                         read_term: 0,
+                        append_term: 0,
                     });
                 }
                 let out = core.handle_message(inbound.from, inbound.msg, corr).await?;
@@ -360,6 +363,7 @@ async fn run_loop(
                             oneshot: Some(resp),
                             read_key: None,
                             read_term: 0,
+                            append_term: 0,
                         });
                         let out = core.handle_message(None, Message::Client(req), corr).await?;
                         apply_outbound(&mut core, &peers, out, &mut election, &mut heartbeat, &mut pending, &mut corr_replies).await;
@@ -402,6 +406,9 @@ async fn apply_outbound(
             Outbound::ClientWaitCommit { corr, wait_index } => {
                 if let Some(mut p) = corr_replies.remove(&corr) {
                     p.wait_index = wait_index;
+                    // Emitted by the same handler that appended the entry, so
+                    // the current term is the entry's term.
+                    p.append_term = core.persistent.current_term;
                     pending.push(p);
                 }
             }
@@ -459,7 +466,19 @@ async fn flush_pending_commits(
     let commit = core.commit_index();
     let mut still = Vec::new();
     for mut p in pending.drain(..) {
-        if p.wait_index > 0 && commit >= p.wait_index {
+        if p.wait_index == 0 {
+            still.push(p);
+            continue;
+        }
+        // The slot may have been overwritten by a later leader (Raft §5.3):
+        // committing *an* entry at `wait_index` is not committing *ours*.
+        // `None` means the index was compacted into a snapshot; compaction
+        // only covers committed entries, and an overwrite would have been
+        // seen here first, so it is treated as ours.
+        let term_now = core.persistent.log.term_at(p.wait_index);
+        if term_now.is_some_and(|t| t != p.append_term) {
+            deliver_client(&mut p, ClientResponse::not_leader(core.volatile.leader_id)).await;
+        } else if commit >= p.wait_index {
             deliver_client(&mut p, ClientResponse::ok_put()).await;
         } else {
             still.push(p);
