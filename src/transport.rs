@@ -23,7 +23,7 @@ use tracing::{debug, warn};
 use crate::rpc::{self, Message, NodeId};
 
 /// Largest frame payload accepted or produced (bytes).
-pub const MAX_FRAME: usize = 16 * 1024 * 1024;
+pub const MAX_FRAME: usize = rpc::MAX_FRAME;
 
 fn invalid(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, e)
