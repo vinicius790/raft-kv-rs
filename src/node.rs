@@ -379,6 +379,7 @@ async fn run_loop(
                                 oneshot: Some(resp),
                                 read_key: None,
                                 read_term: 0,
+                                append_term: 0,
                             });
                             batch.push((corr, key, value));
                             if batch.len() >= core.max_client_batch.max(1)
@@ -466,6 +467,7 @@ async fn run_cmd(
                     oneshot: Some(resp),
                     read_key: None,
                     read_term: 0,
+                    append_term: 0,
                 },
             );
             core.handle_message(None, Message::Client(req), corr).await
