@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
-use raft_mvp::node::{spawn_cluster, wait_for_leader};
-use raft_mvp::raft::TimingConfig;
+use raft_kv_rs::node::{spawn_cluster, wait_for_leader};
+use raft_kv_rs::raft::TimingConfig;
 
 fn fast_timing() -> TimingConfig {
     TimingConfig {

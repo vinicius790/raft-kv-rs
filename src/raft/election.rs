@@ -1,4 +1,4 @@
-//! Election helpers: vote eligibility and majority.
+//! Election helpers: vote eligibility. Quorum math lives in `crate::quorum`.
 
 use crate::raft::log::RaftLog;
 use crate::rpc::{LogIndex, NodeId, Term};
@@ -18,10 +18,6 @@ pub fn should_grant_vote(
     }
     let can_vote = voted_for.is_none() || voted_for == Some(candidate_id);
     can_vote && log.is_other_up_to_date(last_log_index, last_log_term)
-}
-
-pub fn majority(cluster_size: usize) -> usize {
-    cluster_size / 2 + 1
 }
 
 #[cfg(test)]
@@ -50,11 +46,5 @@ mod tests {
             command: Command::Noop,
         });
         assert!(!should_grant_vote(3, None, &log, 3, 1, 0, 0));
-    }
-
-    #[test]
-    fn majority_of_three() {
-        assert_eq!(majority(3), 2);
-        assert_eq!(majority(5), 3);
     }
 }
