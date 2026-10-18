@@ -9,12 +9,12 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{info, warn, Instrument};
 
 use crate::raft::{Outbound, RaftCore, Role, TimingConfig};
 use crate::rpc::{ClientRequest, ClientResponse, LogIndex, Message, NodeId, NodeStatus};
 use crate::storage::Storage;
-use crate::transport::{self, Inbound, PeerMap};
+use crate::transport::{self, Inbound, PeerMap, PeerPool, PoolConfig};
 
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
@@ -36,6 +36,8 @@ struct PendingPut {
     oneshot: Option<oneshot::Sender<ClientResponse>>,
     read_key: Option<String>,
     read_term: u64,
+    /// Term in which the leader appended the entry at `wait_index`.
+    append_term: u64,
 }
 
 /// Handle to a running node (for tests and embedding).
@@ -64,6 +66,32 @@ enum NodeCmd {
 }
 
 impl NodeHandle {
+    /// Cheap handle sharing the command channel. It cannot shut the node down;
+    /// only the original handle owns shutdown.
+    pub fn client(&self) -> NodeHandle {
+        NodeHandle {
+            id: self.id,
+            addr: self.addr,
+            cmd_tx: self.cmd_tx.clone(),
+            shutdown_tx: Mutex::new(None),
+            join: Mutex::new(None),
+        }
+    }
+
+    /// Delete a key through the log (leader only; waits for commit).
+    pub async fn delete(&self, key: impl Into<String>) -> ClientResponse {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .cmd_tx
+            .send(NodeCmd::Client {
+                req: ClientRequest::Delete { key: key.into() },
+                resp: tx,
+            })
+            .await;
+        rx.await
+            .unwrap_or_else(|_| ClientResponse::err("node gone"))
+    }
+
     pub async fn put(&self, key: impl Into<String>, value: impl Into<String>) -> ClientResponse {
         let (tx, rx) = oneshot::channel();
         let _ = self
@@ -244,6 +272,14 @@ impl NodeHandle {
 
 /// Spawn a Raft node on `cfg.bind`. Returns a handle.
 pub async fn spawn_node(cfg: NodeConfig) -> anyhow::Result<NodeHandle> {
+    spawn_node_with(cfg, transport::Security::default()).await
+}
+
+/// Spawn a node whose peer transport uses `security` (e.g. mutual TLS).
+pub async fn spawn_node_with(
+    cfg: NodeConfig,
+    security: transport::Security,
+) -> anyhow::Result<NodeHandle> {
     let listener = TcpListener::bind(cfg.bind).await?;
     let addr = listener.local_addr()?;
     let learners = cfg.learners.clone();
@@ -253,7 +289,12 @@ pub async fn spawn_node(cfg: NodeConfig) -> anyhow::Result<NodeHandle> {
         .copied()
         .filter(|id| !learners.contains(id))
         .collect();
-    let peers = PeerMap::new(cfg.peers.clone());
+    let peers = PeerPool::new(
+        cfg.id,
+        PeerMap::new(cfg.peers.clone()),
+        PoolConfig::default(),
+    )
+    .with_security(security.clone());
 
     let storage = Storage::open(&cfg.data_dir).await?;
     let mut core =
@@ -267,7 +308,9 @@ pub async fn spawn_node(cfg: NodeConfig) -> anyhow::Result<NodeHandle> {
 
     let id = cfg.id;
     let join = tokio::spawn(async move {
-        let accept = tokio::spawn(transport::accept_loop(listener, inbound_tx));
+        let accept = tokio::spawn(transport::accept_loop_secure(
+            listener, inbound_tx, security,
+        ));
         if let Err(e) = run_loop(core, peers, inbound_rx, cmd_rx, shutdown_rx).await {
             warn!(node = id, error = %e, "node loop exited with error");
         }
@@ -288,7 +331,7 @@ pub async fn spawn_node(cfg: NodeConfig) -> anyhow::Result<NodeHandle> {
 
 async fn run_loop(
     mut core: RaftCore,
-    peers: PeerMap,
+    peers: PeerPool,
     mut inbound_rx: mpsc::Receiver<Inbound>,
     mut cmd_rx: mpsc::Receiver<NodeCmd>,
     mut shutdown_rx: oneshot::Receiver<()>,
@@ -302,6 +345,10 @@ async fn run_loop(
     let corr_gen = AtomicU64::new(1);
     // Map corr → pending slot for inbound client replies
     let mut corr_replies: HashMap<u64, PendingPut> = HashMap::new();
+
+    // Oldest outstanding AppendEntries per peer, for the latency histogram.
+    let mut append_sent: HashMap<NodeId, tokio::time::Instant> = HashMap::new();
+    let mut last_published = tokio::time::Instant::now() - Duration::from_secs(1);
 
     info!(node = core.id, "raft node online");
 
@@ -318,11 +365,15 @@ async fn run_loop(
             }
             _ = &mut heartbeat => {
                 let out = core.on_heartbeat_timeout().await?;
+                track_appends(&out, &mut append_sent);
                 apply_outbound(&mut core, &peers, out, &mut election, &mut heartbeat, &mut pending, &mut corr_replies).await;
                 core.maybe_auto_snapshot().await?;
             }
             Some(inbound) = inbound_rx.recv() => {
                 let corr = corr_gen.fetch_add(1, Ordering::Relaxed);
+                if let Some(from) = inbound.from {
+                    peers.mark_alive(from).await;
+                }
                 if let Some(reply) = inbound.reply {
                     corr_replies.insert(corr, PendingPut {
                         corr,
@@ -331,9 +382,23 @@ async fn run_loop(
                         oneshot: None,
                         read_key: None,
                         read_term: 0,
+                        append_term: 0,
                     });
                 }
-                let out = core.handle_message(inbound.from, inbound.msg, corr).await?;
+                if let (Some(from), Message::AppendEntriesResponse { .. }) = (inbound.from, &inbound.msg) {
+                    if let Some(t0) = append_sent.remove(&from) {
+                        crate::telemetry::record_append_latency(core.id, from, t0.elapsed());
+                    }
+                }
+                let span = tracing::debug_span!(
+                    "rpc",
+                    node = core.id,
+                    kind = msg_kind(&inbound.msg),
+                    peer = ?inbound.from,
+                    term = core.persistent.current_term
+                );
+                let out = core.handle_message(inbound.from, inbound.msg, corr).instrument(span).await?;
+                track_appends(&out, &mut append_sent);
                 apply_outbound(&mut core, &peers, out, &mut election, &mut heartbeat, &mut pending, &mut corr_replies).await;
                 core.maybe_auto_snapshot().await?;
                 flush_pending_commits(&core, &mut pending, &mut corr_replies).await;
@@ -351,6 +416,52 @@ async fn run_loop(
                         core.reload_peer_addrs(map);
                         peers.reload(new_peers).await;
                     }
+                    NodeCmd::Client { req: ClientRequest::Put { key, value }, resp } => {
+                        // Fold every Put already queued into one proposal.
+                        let mut batch = Vec::new();
+                        let mut bytes = 0usize;
+                        let mut carry = None;
+                        let mut next = Some((key, value, resp));
+                        while let Some((key, value, resp)) = next.take() {
+                            bytes += key.len() + value.len();
+                            let corr = corr_gen.fetch_add(1, Ordering::Relaxed);
+                            corr_replies.insert(corr, PendingPut {
+                                corr,
+                                wait_index: 0,
+                                reply: None,
+                                oneshot: Some(resp),
+                                read_key: None,
+                                read_term: 0,
+                                append_term: 0,
+                            });
+                            batch.push((corr, key, value));
+                            if batch.len() >= core.max_client_batch.max(1)
+                                || bytes >= core.max_client_batch_bytes
+                            {
+                                break;
+                            }
+                            match cmd_rx.try_recv() {
+                                Ok(NodeCmd::Client { req: ClientRequest::Put { key, value }, resp }) => {
+                                    next = Some((key, value, resp));
+                                }
+                                Ok(other) => carry = Some(other),
+                                Err(_) => {}
+                            }
+                        }
+                        let out = core.handle_put_batch(batch).await?;
+                        track_appends(&out, &mut append_sent);
+                        apply_outbound(&mut core, &peers, out, &mut election, &mut heartbeat, &mut pending, &mut corr_replies).await;
+                        core.maybe_auto_snapshot().await?;
+                        flush_pending_commits(&core, &mut pending, &mut corr_replies).await;
+                        if let Some(cmd) = carry {
+                            // Keep FIFO order: run the command that ended the batch now.
+                            let out = run_cmd(&mut core, cmd, &corr_gen, &mut corr_replies, &peers).await?;
+                            track_appends(&out, &mut append_sent);
+                            apply_outbound(&mut core, &peers, out, &mut election, &mut heartbeat, &mut pending, &mut corr_replies).await;
+                            core.maybe_auto_snapshot().await?;
+                            flush_pending_commits(&core, &mut pending, &mut corr_replies).await;
+                        }
+                    }
                     NodeCmd::Client { req, resp } => {
                         let corr = corr_gen.fetch_add(1, Ordering::Relaxed);
                         corr_replies.insert(corr, PendingPut {
@@ -360,8 +471,10 @@ async fn run_loop(
                             oneshot: Some(resp),
                             read_key: None,
                             read_term: 0,
+                            append_term: 0,
                         });
                         let out = core.handle_message(None, Message::Client(req), corr).await?;
+                        track_appends(&out, &mut append_sent);
                         apply_outbound(&mut core, &peers, out, &mut election, &mut heartbeat, &mut pending, &mut corr_replies).await;
                         core.maybe_auto_snapshot().await?;
                         flush_pending_commits(&core, &mut pending, &mut corr_replies).await;
@@ -369,26 +482,107 @@ async fn run_loop(
                 }
             }
         }
+        if last_published.elapsed() >= Duration::from_millis(50) {
+            crate::telemetry::record_snapshot(&core.metrics());
+            last_published = tokio::time::Instant::now();
+        }
     }
     Ok(())
 }
 
+fn track_appends(out: &[Outbound], sent: &mut HashMap<NodeId, tokio::time::Instant>) {
+    for ob in out {
+        if let Outbound::Send {
+            to,
+            msg: Message::AppendEntries { .. },
+        } = ob
+        {
+            sent.entry(*to).or_insert_with(tokio::time::Instant::now);
+        }
+    }
+}
+
+/// Run one non-batched command; returns the core's outbound actions.
+async fn run_cmd(
+    core: &mut RaftCore,
+    cmd: NodeCmd,
+    corr_gen: &AtomicU64,
+    corr_replies: &mut HashMap<u64, PendingPut>,
+    peers: &PeerPool,
+) -> anyhow::Result<Vec<Outbound>> {
+    match cmd {
+        NodeCmd::Status { resp } => {
+            let _ = resp.send(core.status());
+            Ok(vec![])
+        }
+        NodeCmd::Metrics { resp } => {
+            let _ = resp.send(core.metrics());
+            Ok(vec![])
+        }
+        NodeCmd::ReloadPeers { peers: new_peers } => {
+            let map = new_peers
+                .iter()
+                .map(|(id, addr)| (*id, addr.to_string()))
+                .collect();
+            core.reload_peer_addrs(map);
+            peers.reload(new_peers).await;
+            Ok(vec![])
+        }
+        NodeCmd::Client { req, resp } => {
+            let corr = corr_gen.fetch_add(1, Ordering::Relaxed);
+            corr_replies.insert(
+                corr,
+                PendingPut {
+                    corr,
+                    wait_index: 0,
+                    reply: None,
+                    oneshot: Some(resp),
+                    read_key: None,
+                    read_term: 0,
+                    append_term: 0,
+                },
+            );
+            core.handle_message(None, Message::Client(req), corr).await
+        }
+    }
+}
+
+fn msg_kind(m: &Message) -> &'static str {
+    match m {
+        Message::RequestVote { .. } => "request_vote",
+        Message::RequestVoteResponse { .. } => "request_vote_resp",
+        Message::PreVote { .. } => "pre_vote",
+        Message::PreVoteResponse { .. } => "pre_vote_resp",
+        Message::AppendEntries { .. } => "append_entries",
+        Message::AppendEntriesResponse { .. } => "append_entries_resp",
+        Message::InstallSnapshot { .. } => "install_snapshot",
+        Message::InstallSnapshotResponse { .. } => "install_snapshot_resp",
+        Message::TimeoutNow { .. } => "timeout_now",
+        Message::Client(_) => "client",
+        _ => "admin",
+    }
+}
+
 async fn apply_outbound(
     core: &mut RaftCore,
-    peers: &PeerMap,
+    peers: &PeerPool,
     out: Vec<Outbound>,
     election: &mut std::pin::Pin<&mut tokio::time::Sleep>,
     heartbeat: &mut std::pin::Pin<&mut tokio::time::Sleep>,
     pending: &mut Vec<PendingPut>,
     corr_replies: &mut HashMap<u64, PendingPut>,
 ) {
+    if core.is_leader() {
+        // New term as leader: dial every peer now so the first AppendEntries
+        // (which announces the leader) is not dropped by an old dial backoff.
+        peers.on_leader_term(core.persistent.current_term).await;
+    }
     for ob in out {
         match ob {
             Outbound::Send { to, msg } => {
                 let peers = peers.clone();
-                let from = core.id;
                 tokio::spawn(async move {
-                    let _ = transport::send_peer_message(&peers, to, from, msg).await;
+                    let _ = peers.send(to, &msg).await;
                 });
             }
             Outbound::ClientReply { corr, resp } => {
@@ -402,6 +596,9 @@ async fn apply_outbound(
             Outbound::ClientWaitCommit { corr, wait_index } => {
                 if let Some(mut p) = corr_replies.remove(&corr) {
                     p.wait_index = wait_index;
+                    // Emitted by the same handler that appended the entry, so
+                    // the current term is the entry's term.
+                    p.append_term = core.persistent.current_term;
                     pending.push(p);
                 }
             }
@@ -449,6 +646,36 @@ async fn apply_outbound(
             .as_mut()
             .reset(tokio::time::Instant::now() + Duration::from_secs(3600));
     }
+    rearm_fired_timers(core, election, heartbeat);
+}
+
+/// A tokio `Sleep` stays ready once it has fired. If the core did not ask for
+/// a reset (e.g. a heartbeat tick after stepping down returns nothing), the
+/// `select!` would take that branch on every iteration and spin a CPU core.
+fn rearm_fired_timers(
+    core: &RaftCore,
+    election: &mut std::pin::Pin<&mut tokio::time::Sleep>,
+    heartbeat: &mut std::pin::Pin<&mut tokio::time::Sleep>,
+) {
+    let now = tokio::time::Instant::now();
+    if heartbeat.is_elapsed() {
+        let next = if core.is_leader() {
+            core.heartbeat_interval()
+        } else {
+            Duration::from_secs(3600)
+        };
+        heartbeat.as_mut().reset(now + next);
+    }
+    if election.is_elapsed() {
+        let next = if core.is_leader() && core.enable_check_quorum {
+            core.check_quorum_timeout()
+        } else if core.is_leader() {
+            Duration::from_secs(3600)
+        } else {
+            core.random_election_timeout()
+        };
+        election.as_mut().reset(now + next);
+    }
 }
 
 async fn flush_pending_commits(
@@ -459,7 +686,19 @@ async fn flush_pending_commits(
     let commit = core.commit_index();
     let mut still = Vec::new();
     for mut p in pending.drain(..) {
-        if p.wait_index > 0 && commit >= p.wait_index {
+        if p.wait_index == 0 {
+            still.push(p);
+            continue;
+        }
+        // The slot may have been overwritten by a later leader (Raft §5.3):
+        // committing *an* entry at `wait_index` is not committing *ours*.
+        // `None` means the index was compacted into a snapshot; compaction
+        // only covers committed entries, and an overwrite would have been
+        // seen here first, so it is treated as ours.
+        let term_now = core.persistent.log.term_at(p.wait_index);
+        if term_now.is_some_and(|t| t != p.append_term) {
+            deliver_client(&mut p, ClientResponse::not_leader(core.volatile.leader_id)).await;
+        } else if commit >= p.wait_index {
             deliver_client(&mut p, ClientResponse::ok_put()).await;
         } else {
             still.push(p);
@@ -478,21 +717,23 @@ async fn deliver_client(p: &mut PendingPut, resp: ClientResponse) {
 }
 
 /// Convenience: spawn a local 3-node cluster for tests/demos.
+///
+/// `base_port = 0` picks three free ephemeral ports (safe for parallel test
+/// runs); otherwise nodes listen on `base_port..base_port+3`.
 pub async fn spawn_cluster(
     base_port: u16,
     data_root: PathBuf,
     timing: TimingConfig,
 ) -> anyhow::Result<Vec<NodeHandle>> {
-    let addrs: Vec<(NodeId, SocketAddr)> = (0..3)
-        .map(|i| {
-            (
-                (i + 1) as NodeId,
-                format!("127.0.0.1:{}", base_port + i as u16)
-                    .parse()
-                    .unwrap(),
-            )
-        })
-        .collect();
+    let mut addrs: Vec<(NodeId, SocketAddr)> = Vec::new();
+    for i in 0..3u16 {
+        let addr: SocketAddr = if base_port == 0 {
+            std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?
+        } else {
+            format!("127.0.0.1:{}", base_port + i).parse()?
+        };
+        addrs.push(((i + 1) as NodeId, addr));
+    }
 
     let mut handles = Vec::new();
     for (id, bind) in &addrs {
@@ -523,6 +764,24 @@ pub async fn wait_for_leader(handles: &[NodeHandle], timeout: Duration) -> Optio
         for h in handles {
             let st = h.status().await;
             if st.role == "Leader" {
+                // The leader learns it won before its first AppendEntries
+                // reaches the followers. Give that heartbeat a short grace
+                // window so callers see a cluster that agrees on the leader;
+                // unreachable nodes only cost the grace period.
+                let grace = tokio::time::Instant::now() + Duration::from_millis(300);
+                while tokio::time::Instant::now() < grace {
+                    let mut agreed = true;
+                    for o in handles {
+                        if o.status().await.leader != Some(st.id) {
+                            agreed = false;
+                            break;
+                        }
+                    }
+                    if agreed {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
                 return Some(st.id);
             }
         }
