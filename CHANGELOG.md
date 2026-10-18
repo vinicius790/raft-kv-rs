@@ -6,6 +6,12 @@ O formato segue o espírito de Keep a Changelog: versão, data, o que entrou e o
 
 ### Corrigido
 
+- Read index podia devolver valor velho (tese do Raft, §6.4). (1) Um líder recém-eleito respondia antes de commitar o noop do próprio termo, com `commit_index` atrasado. (2) Ack de um heartbeat enviado **antes** da leitura contava como confirmação de liderança. Agora a leitura espera o noop do termo commitado e um quorum de respostas da rodada aberta por ela. Testes: `read_index_waits_for_noop_of_current_term`, `read_index_ignores_acks_from_earlier_round`.
+
+### Protocolo
+
+- **Quebra de compatibilidade de rede: campo read_ctx; atualizar todos os nós juntos; formato em disco inalterado.**
+- `AppendEntries` e `AppendEntriesResponse` ganharam o campo `read_ctx: u64` (o follower ecoa). O frame bincode muda: nós desta versão não conversam com nós da anterior; atualize o cluster inteiro de uma vez. `raft-state.bin` não mudou.
 - CI: o `uses:` do `Swatinem/rust-cache` tinha um SHA de 39 caracteres, que não existe, e o job falhava antes de rodar fmt/clippy/test. Agora aponta para o commit completo da tag `v2.9.2` (`6323deb102c322ba6fcbdcafc7e3dddab59af2b6`, conferido com `git ls-remote`).
 
 ## 1000000.0.0 — 2026-10-03
