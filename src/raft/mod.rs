@@ -1403,6 +1403,24 @@ impl RaftCore {
                 ]);
             }
         };
+        if incoming.index <= self.volatile.commit_index {
+            // Stale image (etcd `restore`): we already committed past it.
+            // Installing would roll the KV back. Ack so the leader advances
+            // match_index, but keep log, KV and config as they are.
+            return Ok(vec![
+                Outbound::ResetElectionTimer,
+                Outbound::Send {
+                    to: reply_to,
+                    msg: Message::InstallSnapshotResponse {
+                        term: self.persistent.current_term,
+                        success: true,
+                        last_included_index: incoming.index,
+                        next_offset,
+                        done: true,
+                    },
+                },
+            ]);
+        }
         self.kv.restore_full(blob.kv.clone(), blob.sessions.clone());
         self.persistent
             .log
