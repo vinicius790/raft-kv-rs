@@ -84,6 +84,48 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     Frame::write(stream, msg).await
 }
 
+/// Any bidirectional byte stream (plain TCP or TLS).
+pub trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
+pub type BoxStream = Box<dyn AsyncStream>;
+
+/// Transport security. `Security::default()` is plain TCP.
+#[derive(Clone, Default, Debug)]
+pub struct Security {
+    #[cfg(feature = "tls")]
+    pub tls: Option<Arc<crate::tls::TlsMaterial>>,
+}
+
+impl Security {
+    pub fn plain() -> Self {
+        Self::default()
+    }
+
+    #[cfg(feature = "tls")]
+    pub fn tls(material: crate::tls::TlsMaterial) -> Self {
+        Self {
+            tls: Some(Arc::new(material)),
+        }
+    }
+
+    /// Wrap an outbound TCP stream. `name` is the server name to verify.
+    async fn connect(&self, tcp: TcpStream, _peer: Option<NodeId>) -> std::io::Result<BoxStream> {
+        #[cfg(feature = "tls")]
+        if let Some(t) = &self.tls {
+            let name = match _peer {
+                Some(id) => crate::tls::peer_server_name(id),
+                None => crate::tls::client_server_name(),
+            };
+            let s = t.connector().connect(name, tcp).await?;
+            return Ok(Box::new(s));
+        }
+        Ok(Box::new(tcp))
+    }
+}
+
+/// Decides whether a connection may speak as peer `id` (checked on `PeerHello`).
+pub type Authorize = Box<dyn Fn(NodeId) -> bool + Send + Sync>;
+
 /// Inbound framed message with optional peer id (None for anonymous clients).
 #[derive(Debug)]
 pub struct Inbound {
@@ -161,7 +203,7 @@ impl Default for PoolConfig {
 
 #[derive(Default)]
 struct PeerConn {
-    stream: Option<(SocketAddr, TcpStream)>,
+    stream: Option<(SocketAddr, BoxStream)>,
     failures: u32,
     retry_at: Option<Instant>,
 }
@@ -172,6 +214,7 @@ pub struct PeerPool {
     from: NodeId,
     addrs: PeerMap,
     cfg: PoolConfig,
+    security: Security,
     conns: Arc<Mutex<HashMap<NodeId, Arc<Mutex<PeerConn>>>>>,
 }
 
@@ -181,8 +224,15 @@ impl PeerPool {
             from,
             addrs,
             cfg,
+            security: Security::default(),
             conns: Arc::default(),
         }
+    }
+
+    /// Use TLS (or plain) for every outbound peer connection.
+    pub fn with_security(mut self, security: Security) -> Self {
+        self.security = security;
+        self
     }
 
     pub fn addrs(&self) -> &PeerMap {
@@ -226,7 +276,7 @@ impl PeerPool {
                     ));
                 }
             }
-            match self.dial(addr).await {
+            match self.dial(addr, to).await {
                 Ok(s) => conn.stream = Some((addr, s)),
                 Err(e) => {
                     self.fail(&mut conn);
@@ -263,10 +313,11 @@ impl PeerPool {
         conn.retry_at = Some(Instant::now() + self.backoff(conn.failures));
     }
 
-    async fn dial(&self, addr: SocketAddr) -> std::io::Result<TcpStream> {
+    async fn dial(&self, addr: SocketAddr, to: NodeId) -> std::io::Result<BoxStream> {
         let fut = async {
-            let mut s = TcpStream::connect(addr).await?;
-            s.set_nodelay(true)?;
+            let tcp = TcpStream::connect(addr).await?;
+            tcp.set_nodelay(true)?;
+            let mut s = self.security.connect(tcp, Some(to)).await?;
             Frame::write_bytes(&mut s, &hello_bytes(self.from)?).await?;
             Ok::<_, std::io::Error>(s)
         };
@@ -301,12 +352,55 @@ pub async fn accept_loop(
     listener: TcpListener,
     inbound_tx: mpsc::Sender<Inbound>,
 ) -> anyhow::Result<()> {
+    accept_loop_secure(listener, inbound_tx, Security::default()).await
+}
+
+/// Like [`accept_loop`], with TLS when `security` carries material.
+pub async fn accept_loop_secure(
+    listener: TcpListener,
+    inbound_tx: mpsc::Sender<Inbound>,
+    security: Security,
+) -> anyhow::Result<()> {
+    #[cfg(feature = "tls")]
+    let acceptor = match &security.tls {
+        Some(t) => Some(t.acceptor()?),
+        None => None,
+    };
+    let _ = &security;
     loop {
-        let (mut stream, addr) = listener.accept().await?;
-        let _ = stream.set_nodelay(true);
+        let (tcp, addr) = listener.accept().await?;
+        let _ = tcp.set_nodelay(true);
         let tx = inbound_tx.clone();
+        #[cfg(feature = "tls")]
+        let acceptor = acceptor.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(&mut stream, addr, tx).await {
+            #[cfg(feature = "tls")]
+            if let Some(acc) = acceptor {
+                let hs = tokio::time::timeout(Duration::from_secs(5), acc.accept(tcp)).await;
+                let mut s = match hs {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => return debug!(%addr, error = %e, "tls handshake failed"),
+                    Err(_) => return debug!(%addr, "tls handshake timeout"),
+                };
+                let cert = s
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .and_then(|c| c.first())
+                    .map(|c| c.clone().into_owned());
+                // No client certificate: client path only, never a peer.
+                let authorize: Authorize = Box::new(move |id| {
+                    cert.as_ref()
+                        .is_some_and(|c| crate::tls::cert_names_node(c, id))
+                });
+                if let Err(e) = handle_connection(&mut s, addr, tx, &authorize).await {
+                    debug!(%addr, error = %e, "connection closed/error");
+                }
+                return;
+            }
+            let mut tcp = tcp;
+            let allow: Authorize = Box::new(|_| true);
+            if let Err(e) = handle_connection(&mut tcp, addr, tx, &allow).await {
                 debug!(%addr, error = %e, "connection closed/error");
             }
         });
@@ -318,12 +412,20 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     addr: SocketAddr,
     tx: mpsc::Sender<Inbound>,
+    authorize: &Authorize,
 ) -> std::io::Result<()> {
     let buf = Frame::read_bytes(stream).await?;
 
     // Peer path: first frame is PeerHello with magic, then a stream of messages.
     if let Ok(hello) = bincode::deserialize::<PeerHello>(&buf) {
         if hello.magic == PEER_HELLO_MAGIC {
+            if !authorize(hello.id) {
+                warn!(%addr, claimed = hello.id, "peer hello refused: identity mismatch");
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "peer id not authorized",
+                ));
+            }
             loop {
                 let msg = match Frame::read(stream).await {
                     Ok(m) => m,
@@ -370,8 +472,19 @@ pub async fn client_request(
     msg: Message,
     timeout: Duration,
 ) -> std::io::Result<Message> {
+    client_request_secure(addr, msg, timeout, &Security::default()).await
+}
+
+/// Client helper over TLS (verifies the server as `raft-kv`) or plain TCP.
+pub async fn client_request_secure(
+    addr: SocketAddr,
+    msg: Message,
+    timeout: Duration,
+    security: &Security,
+) -> std::io::Result<Message> {
     let fut = async {
-        let mut stream = TcpStream::connect(addr).await?;
+        let tcp = TcpStream::connect(addr).await?;
+        let mut stream = security.connect(tcp, None).await?;
         Frame::write(&mut stream, &msg).await?;
         Frame::read(&mut stream).await
     };
