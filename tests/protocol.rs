@@ -1667,3 +1667,75 @@ async fn deposed_leader_does_not_serve_read_with_ack_sent_before_read() {
         "deposed leader served a read with an ack sent before the read: {replies:?}"
     );
 }
+
+/// A read parked on the read-index quorum must be answered when the leader is
+/// deposed. Before the fix it stayed in `pending_reads` forever, so the node
+/// never replied and `NodeHandle::get` hung (CI on main hung in Test).
+#[tokio::test]
+async fn deposed_leader_answers_pending_read_instead_of_hanging() {
+    let (_d, mut leader) = elect_leader(vec![2, 3]).await;
+    assert_eq!(leader.volatile.role, Role::Leader);
+    let out = leader
+        .handle_message(
+            None,
+            Message::Client(ClientRequest::Get { key: "x".into() }),
+            9,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !out.iter()
+            .any(|o| matches!(o, Outbound::ClientReply { corr: 9, .. })),
+        "read must wait for the quorum round"
+    );
+    let term = leader.persistent.current_term + 1;
+    let out = leader
+        .handle_message(
+            Some(2),
+            Message::AppendEntries {
+                term,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+                read_ctx: 0,
+            },
+            0,
+        )
+        .await
+        .unwrap();
+    assert_ne!(leader.volatile.role, Role::Leader);
+    let reply = out.iter().find_map(|o| match o {
+        Outbound::ClientReply { corr: 9, resp } => Some(resp.clone()),
+        _ => None,
+    });
+    let reply = reply.expect("pending read left unanswered after step-down");
+    assert!(!reply.ok);
+    assert_eq!(reply.leader_hint, Some(2));
+    assert!(leader.pending_reads.is_empty());
+
+    // Check-quorum step-down (election timer as leader) also answers.
+    let (_d2, mut l2) = elect_leader(vec![2, 3]).await;
+    l2.enable_check_quorum = true;
+    l2.handle_message(
+        None,
+        Message::Client(ClientRequest::Get { key: "x".into() }),
+        7,
+    )
+    .await
+    .unwrap();
+    let mut answered = false;
+    for _ in 0..3 {
+        let out = l2.on_election_timeout().await.unwrap();
+        answered |= out
+            .iter()
+            .any(|o| matches!(o, Outbound::ClientReply { corr: 7, resp } if !resp.ok));
+        if l2.volatile.role != Role::Leader {
+            break;
+        }
+    }
+    if l2.volatile.role != Role::Leader {
+        assert!(answered, "check-quorum step-down left the read unanswered");
+    }
+}

@@ -371,6 +371,12 @@ impl RaftCore {
     }
 
     pub async fn on_election_timeout(&mut self) -> anyhow::Result<Vec<Outbound>> {
+        let mut out = self.election_timeout_inner().await?;
+        out.extend(self.abort_reads_if_deposed());
+        Ok(out)
+    }
+
+    async fn election_timeout_inner(&mut self) -> anyhow::Result<Vec<Outbound>> {
         if self.volatile.role == Role::Leader {
             return self.on_check_quorum().await;
         }
@@ -517,6 +523,12 @@ impl RaftCore {
     }
 
     pub async fn on_heartbeat_timeout(&mut self) -> anyhow::Result<Vec<Outbound>> {
+        let mut out = self.heartbeat_timeout_inner().await?;
+        out.extend(self.abort_reads_if_deposed());
+        Ok(out)
+    }
+
+    async fn heartbeat_timeout_inner(&mut self) -> anyhow::Result<Vec<Outbound>> {
         if self.volatile.role != Role::Leader {
             return Ok(vec![]);
         }
@@ -775,6 +787,41 @@ impl RaftCore {
     }
 
     pub async fn handle_message(
+        &mut self,
+        from: Option<NodeId>,
+        msg: Message,
+        corr: u64,
+    ) -> anyhow::Result<Vec<Outbound>> {
+        let mut out = self.handle_message_inner(from, msg, corr).await?;
+        out.extend(self.abort_reads_if_deposed());
+        Ok(out)
+    }
+
+    /// A read parked on the read-index quorum can only be served by the
+    /// leader of the term it arrived in. Once this node is no longer that
+    /// leader, no ack will ever confirm it: answer `not leader` now instead of
+    /// leaving the client waiting forever.
+    fn abort_reads_if_deposed(&mut self) -> Vec<Outbound> {
+        if self.pending_reads.is_empty() {
+            return vec![];
+        }
+        let term = self.persistent.current_term;
+        let leading = self.volatile.role == Role::Leader;
+        let hint = self.volatile.leader_id.filter(|&l| l != self.id);
+        let (stale, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_reads)
+            .into_iter()
+            .partition(|(_, _, read_term)| !leading || *read_term != term);
+        self.pending_reads = keep;
+        stale
+            .into_iter()
+            .map(|(corr, _, _)| Outbound::ClientReply {
+                corr,
+                resp: ClientResponse::not_leader(hint),
+            })
+            .collect()
+    }
+
+    async fn handle_message_inner(
         &mut self,
         from: Option<NodeId>,
         msg: Message,
