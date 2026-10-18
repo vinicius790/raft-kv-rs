@@ -1,10 +1,12 @@
 //! Config base on truncation (bug 3) and snapshot image / compaction
 //! consistency (bug 4).
 
-use raft_mvp::raft::{ClusterConfig, LogEntry, Membership, Outbound, RaftCore, Role, TimingConfig};
-use raft_mvp::rpc::{ClientRequest, Message, SnapshotBlob};
-use raft_mvp::storage::Storage;
-use raft_mvp::Command;
+use raft_kv_rs::raft::{
+    ClusterConfig, LogEntry, Membership, Outbound, RaftCore, Role, TimingConfig,
+};
+use raft_kv_rs::rpc::{ClientRequest, Message, SnapshotBlob};
+use raft_kv_rs::storage::Storage;
+use raft_kv_rs::Command;
 
 fn timing() -> TimingConfig {
     TimingConfig {
@@ -49,6 +51,7 @@ fn ae(
         prev_log_term: prev_term,
         entries,
         leader_commit: commit,
+        read_ctx: 0,
     }
 }
 
@@ -213,6 +216,7 @@ async fn snapshot_image_is_state_at_snapshot_index() {
                 match_index: last,
                 conflict_index: 0,
                 need_snapshot: false,
+                read_ctx: 0,
             },
             0,
         )
