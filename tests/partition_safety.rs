@@ -1,5 +1,7 @@
 //! Stretch: a minority partition must not commit (no split-brain commit).
 
+mod common;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -15,21 +17,8 @@ fn fast_timing() -> TimingConfig {
     }
 }
 
-/// Ask the OS for free loopback ports (bind 127.0.0.1:0), then release them
-/// so the nodes can bind. No fixed ports, so parallel runs do not collide.
-fn ephemeral_addrs(n: usize) -> Vec<SocketAddr> {
-    let listeners: Vec<std::net::TcpListener> = (0..n)
-        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    listeners.iter().map(|l| l.local_addr().unwrap()).collect()
-}
-
 async fn spawn_three(root: &std::path::Path) -> Vec<NodeHandle> {
-    let addrs: Vec<(u64, SocketAddr)> = ephemeral_addrs(3)
-        .into_iter()
-        .enumerate()
-        .map(|(i, a)| ((i + 1) as u64, a))
-        .collect();
+    let addrs: Vec<(u64, SocketAddr)> = common::ephemeral_addrs(3);
     let mut handles = Vec::new();
     for (id, bind) in &addrs {
         let mut peers = HashMap::new();
