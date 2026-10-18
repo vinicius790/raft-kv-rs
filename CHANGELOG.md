@@ -7,6 +7,7 @@ O formato segue o espírito de Keep a Changelog: versão, data, o que entrou e o
 ### Corrigido
 
 - Transferência de liderança falhava com 5+ voters: o alvo fazia pre-vote e os followers que ainda ouviam o líder antigo recusavam. Agora `TimeoutNow` faz eleição direta, sem pre-vote (modelo do etcd); o voto continua exigindo log em dia. Testes: `timeout_now_transfers_leadership_in_five_node_cluster`, `timeout_now_campaigns_without_pre_vote_and_ignores_stale_term`.
+- CI: o `uses:` do `Swatinem/rust-cache` tinha um SHA de 39 caracteres, que não existe, e o job falhava antes de rodar fmt/clippy/test. Agora aponta para o commit completo da tag `v2.9.2` (`6323deb102c322ba6fcbdcafc7e3dddab59af2b6`, conferido com `git ls-remote`).
 
 ## 1000000.0.0 — 2026-10-03
 
