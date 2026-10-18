@@ -244,14 +244,6 @@ impl NodeHandle {
 
 /// Spawn a Raft node on `cfg.bind`. Returns a handle.
 pub async fn spawn_node(cfg: NodeConfig) -> anyhow::Result<NodeHandle> {
-    spawn_node_with(cfg, transport::Security::default()).await
-}
-
-/// Spawn a node whose peer transport uses `security` (e.g. mutual TLS).
-pub async fn spawn_node_with(
-    cfg: NodeConfig,
-    security: transport::Security,
-) -> anyhow::Result<NodeHandle> {
     let listener = TcpListener::bind(cfg.bind).await?;
     let addr = listener.local_addr()?;
     let learners = cfg.learners.clone();
@@ -265,8 +257,7 @@ pub async fn spawn_node_with(
         cfg.id,
         PeerMap::new(cfg.peers.clone()),
         PoolConfig::default(),
-    )
-    .with_security(security.clone());
+    );
 
     let storage = Storage::open(&cfg.data_dir).await?;
     let mut core =
@@ -280,9 +271,7 @@ pub async fn spawn_node_with(
 
     let id = cfg.id;
     let join = tokio::spawn(async move {
-        let accept = tokio::spawn(transport::accept_loop_secure(
-            listener, inbound_tx, security,
-        ));
+        let accept = tokio::spawn(transport::accept_loop(listener, inbound_tx));
         if let Err(e) = run_loop(core, peers, inbound_rx, cmd_rx, shutdown_rx).await {
             warn!(node = id, error = %e, "node loop exited with error");
         }
