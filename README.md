@@ -1,4 +1,4 @@
-# raft-mvp
+# raft-kv-rs
 
 Implementação didática do protocolo [Raft](https://raft.github.io/raft.pdf) (Ongaro e Ousterhout) em Rust. Um processo é um servidor. O cliente fala TCP. O log é a fonte da verdade do KV.
 

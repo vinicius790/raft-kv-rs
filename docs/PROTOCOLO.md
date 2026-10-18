@@ -1,4 +1,4 @@
-# Protocolo — raft-mvp 1000000.0.0
+# Protocolo — raft-kv-rs 1000000.0.0
 
 O que o núcleo faz com cada RPC, e as invariantes que os testes seguram. A versão 1000000.0.0 foi pedida; não significa produção. Disco continua na versão 1 (`docs/SPEC.md`). Não há número de throughput, latência ou tempo de eleição.
 

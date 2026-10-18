@@ -1,11 +1,11 @@
 //! Protocol tests for joint consensus, snapshots, pre-vote, transfer,
 //! read-index, learners, batching, sessions, metrics, and the simulator.
 
-use raft_mvp::raft::{ClusterConfig, Membership, Outbound, RaftCore, Role, TimingConfig};
-use raft_mvp::rpc::{ClientRequest, Message, SnapshotBlob};
-use raft_mvp::sim::{self, Sim};
-use raft_mvp::storage::Storage;
-use raft_mvp::Command;
+use raft_kv_rs::raft::{ClusterConfig, Membership, Outbound, RaftCore, Role, TimingConfig};
+use raft_kv_rs::rpc::{ClientRequest, Message, SnapshotBlob};
+use raft_kv_rs::sim::{self, Sim};
+use raft_kv_rs::storage::Storage;
+use raft_kv_rs::Command;
 
 fn timing() -> TimingConfig {
     TimingConfig {
@@ -671,7 +671,7 @@ async fn batch_append_entries_and_gap_rejected() {
                 leader_id: 1,
                 prev_log_index: 5,
                 prev_log_term: 1,
-                entries: vec![raft_mvp::LogEntry {
+                entries: vec![raft_kv_rs::LogEntry {
                     term: 1,
                     command: Command::Put {
                         key: "g".into(),
@@ -871,7 +871,7 @@ async fn chunk_gap_rejected_and_three_chunks_catch_up() {
 
     // Gap: a follower with a local entry must not truncate on a non-contiguous chunk.
     let (_dg, mut gapped) = fresh(3, vec![1]).await;
-    gapped.persistent.log.append(raft_mvp::LogEntry {
+    gapped.persistent.log.append(raft_kv_rs::LogEntry {
         term: 1,
         command: Command::Put {
             key: "keep".into(),

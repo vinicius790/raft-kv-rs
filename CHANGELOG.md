@@ -2,6 +2,14 @@
 
 O formato segue o espírito de Keep a Changelog: versão, data, o que entrou e o que continua de fora. Não há seção de desempenho.
 
+## Não lançado
+
+### Mudou
+
+- Crate renomeado de `raft-mvp` para `raft-kv-rs`, igual ao repositório. O binário continua `raft-node`. Quem importa a biblioteca troca `raft_mvp::` por `raft_kv_rs::`; o filtro de log padrão da CLI passa a ser `raft_kv_rs=info`.
+- `Cargo.toml`: `repository`/`homepage` apontam para https://github.com/vinicius790/raft-kv-rs e o e-mail placeholder saiu de `authors`.
+- Formato em disco (`raft-state.bin`, versão 1) e protocolo de rede não mudaram.
+
 ## 1000000.0.0 — 2026-10-03
 
 O número **1000000.0.0** foi pedido explicitamente. Não declara maturidade de produção, não aproxima este crate de etcd e não congela uma API nova de disco. O layout de `raft-state.bin` continua a versão 1.
