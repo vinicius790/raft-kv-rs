@@ -10,7 +10,7 @@ O que o núcleo faz com cada RPC, e as invariantes que os testes seguram. A vers
 | `RequestVote` / `RequestVoteResponse` | candidato | voto só se o log do candidato não está atrás; learner não vota |
 | `AppendEntries` / `AppendEntriesResponse` | líder | lote até `max_batch`; `matchIndex` só anda no ack; `need_snapshot` quando o prefixo sumiu |
 | `InstallSnapshot` / `InstallSnapshotResponse` | líder | fatias `offset`/`done`; log só trunca no `done` **e** se o CRC-32 da imagem fecha |
-| `TimeoutNow` | líder, alvo em dia | alvo faz pre-vote; pre-vote perdido não sobe termo |
+| `TimeoutNow` | líder, alvo em dia | alvo faz eleição direta, sem pre-vote (modelo etcd); termo antigo é ignorado |
 | `Client` | cliente | `Put`, `Get` (read index), `RawGet`, `SessionPut`, `ChangeMembership`, `PromoteLearner`, `TransferLeadership` |
 | `StatusRequest` | CLI `status` | papel, termo, commit, contadores do processo |
 | `MetricsRequest` | CLI `metrics` | os mesmos contadores, sem taxa |

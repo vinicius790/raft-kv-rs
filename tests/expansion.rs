@@ -295,3 +295,58 @@ async fn localhost_cluster_exposes_live_counters() {
         h.shutdown().await;
     }
 }
+
+/// Regression: a quorum ack must not push the leader's check-quorum timer.
+/// Logical clock, window W = 10. Check at 10, ack at 9, partition at 9.5.
+/// Fixed windows: check at 10 passes (ack at 9), check at 20 steps down.
+/// When acks re-armed the timer, the check moved to 19 (passes on the pre-
+/// partition ack) and the step-down slipped to 29: one extra window.
+#[tokio::test]
+async fn check_quorum_window_is_not_extended_by_acks() {
+    const W: u64 = 10;
+    let (_d, mut leader) = elect_leader(vec![2, 3]).await;
+    let term = leader.persistent.current_term;
+    let mut deadline = W; // armed by become_leader at t = 0
+    let rearm = |out: &[Outbound], now: u64, deadline: &mut u64| {
+        if out
+            .iter()
+            .any(|o| matches!(o, Outbound::ResetElectionTimer))
+        {
+            *deadline = now + W;
+        }
+    };
+    let li = leader.last_log_index();
+    let out = leader
+        .handle_message(
+            Some(2),
+            Message::AppendEntriesResponse {
+                term,
+                success: true,
+                match_index: li,
+                conflict_index: 0,
+                need_snapshot: false,
+                read_ctx: 0,
+            },
+            0,
+        )
+        .await
+        .unwrap();
+    rearm(&out, 9, &mut deadline);
+    // Partition at 9.5: no more acks. Advance the clock to 20.
+    let mut stepped_down_at = None;
+    for now in 10..=20 {
+        if now == deadline {
+            let out = leader.on_election_timeout().await.unwrap();
+            if leader.volatile.role != Role::Leader {
+                stepped_down_at = Some(now);
+                break;
+            }
+            rearm(&out, now, &mut deadline);
+        }
+    }
+    assert_eq!(
+        stepped_down_at,
+        Some(20),
+        "check-quorum took more than one extra window (deadline {deadline})"
+    );
+}
