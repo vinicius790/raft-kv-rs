@@ -2,10 +2,10 @@
 
 use std::time::Duration;
 
-use raft_mvp::node::{
+use raft_kv_rs::node::{
     get_redirect, put_redirect, spawn_cluster, spawn_node, wait_for_leader, NodeConfig,
 };
-use raft_mvp::raft::TimingConfig;
+use raft_kv_rs::raft::TimingConfig;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
@@ -153,9 +153,9 @@ async fn persist_survives_full_cluster_restart() {
 
 #[tokio::test]
 async fn crash_between_vote_and_log_persists_only_the_first_write() {
-    use raft_mvp::raft::LogEntry;
-    use raft_mvp::storage::{CrashPolicy, Storage};
-    use raft_mvp::Command;
+    use raft_kv_rs::raft::LogEntry;
+    use raft_kv_rs::storage::{CrashPolicy, Storage};
+    use raft_kv_rs::Command;
 
     let dir = tempfile::tempdir().unwrap();
     let crash = CrashPolicy::new();
