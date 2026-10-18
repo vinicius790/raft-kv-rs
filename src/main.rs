@@ -7,10 +7,10 @@ use std::time::Duration;
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
-use raft_mvp::node::{spawn_node, NodeConfig};
-use raft_mvp::raft::TimingConfig;
-use raft_mvp::rpc::{ClientRequest, ClientResponse, Message, NodeId};
-use raft_mvp::transport;
+use raft_kv_rs::node::{spawn_node, NodeConfig};
+use raft_kv_rs::raft::TimingConfig;
+use raft_kv_rs::rpc::{ClientRequest, ClientResponse, Message, NodeId};
+use raft_kv_rs::transport;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -34,11 +34,11 @@ enum Commands {
         peers: String,
         #[arg(long, default_value = "./data")]
         data_dir: PathBuf,
-        #[arg(long, default_value_t = raft_mvp::DEFAULT_HEARTBEAT_MS)]
+        #[arg(long, default_value_t = raft_kv_rs::DEFAULT_HEARTBEAT_MS)]
         heartbeat_ms: u64,
-        #[arg(long, default_value_t = raft_mvp::DEFAULT_ELECTION_MIN_MS)]
+        #[arg(long, default_value_t = raft_kv_rs::DEFAULT_ELECTION_MIN_MS)]
         election_min_ms: u64,
-        #[arg(long, default_value_t = raft_mvp::DEFAULT_ELECTION_MAX_MS)]
+        #[arg(long, default_value_t = raft_kv_rs::DEFAULT_ELECTION_MAX_MS)]
         election_max_ms: u64,
         /// Learners: id=addr,id=addr. Dialed like peers, but they do not vote.
         #[arg(long, default_value = "")]
@@ -114,7 +114,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("raft_mvp=info".parse()?))
+        .with_env_filter(EnvFilter::from_default_env().add_directive("raft_kv_rs=info".parse()?))
         .init();
 
     let cli = Cli::parse();

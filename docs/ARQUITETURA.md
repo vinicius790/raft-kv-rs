@@ -1,4 +1,4 @@
-# Arquitetura — raft-mvp 1000000.0.0
+# Arquitetura — raft-kv-rs 1000000.0.0
 
 Este documento descreve o que o código faz hoje. A versão 1000000.0.0 foi pedida; não é um carimbo de produção. Não há número de throughput, latência ou tempo de eleição medido.
 

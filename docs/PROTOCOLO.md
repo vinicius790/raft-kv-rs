@@ -1,4 +1,4 @@
-# Protocolo — raft-mvp 1000000.0.0
+# Protocolo — raft-kv-rs 1000000.0.0
 
 O que o núcleo faz com cada RPC, e as invariantes que os testes seguram. A versão 1000000.0.0 foi pedida; não significa produção. Disco continua na versão 1 (`docs/SPEC.md`). Não há número de throughput, latência ou tempo de eleição.
 
@@ -26,7 +26,7 @@ O frame é `u32` BE + bincode. Teto 16 MiB no TCP.
 4. **Config no log.** A config em vigor é a última `ChangeConfig` do log, commitada ou não. Recover e `apply_committed` não voltam para um joint se `C_new` já está no log.
 5. **Snapshot.** Prefixo abaixo de `snapshot_index` não volta por `AppendEntries`. Instalação truncada ou com CRC diferente do campo `checksum` não trunca e não restaura o KV.
 6. **Sessão.** `(client_id, serial)` entra no log no máximo uma vez. `client_id` 0 é recusado.
-7. **Read index.** `Get` só responde com quorum de heartbeat no termo em que o processo é líder. `RawGet` não espera.
+7. **Read index.** `Get` só responde depois de commitar o noop do termo atual e de um quorum responder à rodada de heartbeat aberta pela leitura (`read_ctx` ecoado no `AppendEntriesResponse`). `RawGet` não espera.
 8. **Trace.** Evento de eleição só sai de `start_election`. Commit só quando `commitIndex` sobe. Snapshot só quando a imagem é compactada ou aceita. O anel não é durável.
 
 ## Membership
