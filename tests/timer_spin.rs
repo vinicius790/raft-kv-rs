@@ -71,7 +71,16 @@ async fn former_leader_does_not_busy_loop() {
     let target = (1..=3).find(|i| *i != old).unwrap();
     let ln = nodes.iter().find(|n| n.id == old).unwrap();
     assert!(ln.put("k", "v").await.ok);
-    let r = ln.transfer_leadership(target).await;
+    // "target not caught up" is a retryable answer: the put may have
+    // committed on the other follower before `target` acked it.
+    let mut r = ln.transfer_leadership(target).await;
+    for _ in 0..50 {
+        if r.ok || r.error.as_deref() != Some("target not caught up") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        r = ln.transfer_leadership(target).await;
+    }
     assert!(r.ok, "transfer: {:?}", r.error);
     for _ in 0..100 {
         if ln.status().await.role != "Leader" {
