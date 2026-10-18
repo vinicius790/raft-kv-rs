@@ -351,6 +351,49 @@ async fn run_loop(
                         core.reload_peer_addrs(map);
                         peers.reload(new_peers).await;
                     }
+                    NodeCmd::Client { req: ClientRequest::Put { key, value }, resp } => {
+                        // Fold every Put already queued into one proposal.
+                        let mut batch = Vec::new();
+                        let mut bytes = 0usize;
+                        let mut carry = None;
+                        let mut next = Some((key, value, resp));
+                        while let Some((key, value, resp)) = next.take() {
+                            bytes += key.len() + value.len();
+                            let corr = corr_gen.fetch_add(1, Ordering::Relaxed);
+                            corr_replies.insert(corr, PendingPut {
+                                corr,
+                                wait_index: 0,
+                                reply: None,
+                                oneshot: Some(resp),
+                                read_key: None,
+                                read_term: 0,
+                            });
+                            batch.push((corr, key, value));
+                            if batch.len() >= core.max_client_batch.max(1)
+                                || bytes >= core.max_client_batch_bytes
+                            {
+                                break;
+                            }
+                            match cmd_rx.try_recv() {
+                                Ok(NodeCmd::Client { req: ClientRequest::Put { key, value }, resp }) => {
+                                    next = Some((key, value, resp));
+                                }
+                                Ok(other) => carry = Some(other),
+                                Err(_) => {}
+                            }
+                        }
+                        let out = core.handle_put_batch(batch).await?;
+                        apply_outbound(&mut core, &peers, out, &mut election, &mut heartbeat, &mut pending, &mut corr_replies).await;
+                        core.maybe_auto_snapshot().await?;
+                        flush_pending_commits(&core, &mut pending, &mut corr_replies).await;
+                        if let Some(cmd) = carry {
+                            // Keep FIFO order: run the command that ended the batch now.
+                            let out = run_cmd(&mut core, cmd, &corr_gen, &mut corr_replies, &peers).await?;
+                            apply_outbound(&mut core, &peers, out, &mut election, &mut heartbeat, &mut pending, &mut corr_replies).await;
+                            core.maybe_auto_snapshot().await?;
+                            flush_pending_commits(&core, &mut pending, &mut corr_replies).await;
+                        }
+                    }
                     NodeCmd::Client { req, resp } => {
                         let corr = corr_gen.fetch_add(1, Ordering::Relaxed);
                         corr_replies.insert(corr, PendingPut {
@@ -371,6 +414,50 @@ async fn run_loop(
         }
     }
     Ok(())
+}
+
+/// Run one non-batched command; returns the core's outbound actions.
+async fn run_cmd(
+    core: &mut RaftCore,
+    cmd: NodeCmd,
+    corr_gen: &AtomicU64,
+    corr_replies: &mut HashMap<u64, PendingPut>,
+    peers: &PeerMap,
+) -> anyhow::Result<Vec<Outbound>> {
+    match cmd {
+        NodeCmd::Status { resp } => {
+            let _ = resp.send(core.status());
+            Ok(vec![])
+        }
+        NodeCmd::Metrics { resp } => {
+            let _ = resp.send(core.metrics());
+            Ok(vec![])
+        }
+        NodeCmd::ReloadPeers { peers: new_peers } => {
+            let map = new_peers
+                .iter()
+                .map(|(id, addr)| (*id, addr.to_string()))
+                .collect();
+            core.reload_peer_addrs(map);
+            peers.reload(new_peers).await;
+            Ok(vec![])
+        }
+        NodeCmd::Client { req, resp } => {
+            let corr = corr_gen.fetch_add(1, Ordering::Relaxed);
+            corr_replies.insert(
+                corr,
+                PendingPut {
+                    corr,
+                    wait_index: 0,
+                    reply: None,
+                    oneshot: Some(resp),
+                    read_key: None,
+                    read_term: 0,
+                },
+            );
+            core.handle_message(None, Message::Client(req), corr).await
+        }
+    }
 }
 
 async fn apply_outbound(
