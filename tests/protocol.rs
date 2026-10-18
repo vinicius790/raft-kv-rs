@@ -1566,3 +1566,104 @@ async fn read_index_ignores_acks_from_earlier_round() {
     let fresh_ack = leader.handle_message(Some(2), ack(round), 0).await.unwrap();
     assert_eq!(served_value(&fresh_ack, 11), Some(None));
 }
+
+/// Deliver queued messages among `alive` nodes until quiet. Every message is
+/// produced by the cores themselves; nothing is hand-built.
+async fn pump(nodes: &mut [RaftCore], mut q: Vec<(u64, u64, Message)>, alive: &[u64]) {
+    let mut steps = 0;
+    while let Some((from, to, msg)) = q.pop() {
+        steps += 1;
+        assert!(steps < 10_000, "message storm");
+        if !alive.contains(&from) || !alive.contains(&to) {
+            continue;
+        }
+        let n = nodes.iter_mut().find(|n| n.id == to).unwrap();
+        let out = n.handle_message(Some(from), msg, 0).await.unwrap();
+        for (dst, m) in sends(&out) {
+            q.insert(0, (to, dst, m));
+        }
+    }
+}
+
+fn outbox(from: u64, out: &[Outbound]) -> Vec<(u64, u64, Message)> {
+    sends(out)
+        .into_iter()
+        .map(|(to, m)| (from, to, m))
+        .collect()
+}
+
+/// Regression, public API only (compiles on the old main): an ack that
+/// node 2 sent BEFORE a new leader was elected and committed x=2 reaches the
+/// old leader after a client read. Counting it served the stale x=1.
+#[tokio::test]
+async fn deposed_leader_does_not_serve_read_with_ack_sent_before_read() {
+    let mut nodes = Vec::new();
+    for id in 1..=3u64 {
+        let peers = (1..=3).filter(|p| *p != id).collect();
+        let mut n = RaftCore::open(id, peers, Storage::ephemeral(), timing())
+            .await
+            .unwrap();
+        n.enable_pre_vote = false;
+        nodes.push(n);
+    }
+    let all = [1u64, 2, 3];
+    let out = nodes[0].on_election_timeout().await.unwrap();
+    pump(&mut nodes, outbox(1, &out), &all).await;
+    assert_eq!(nodes[0].volatile.role, Role::Leader);
+    let put = |v: &str| {
+        Message::Client(ClientRequest::Put {
+            key: "x".into(),
+            value: v.into(),
+        })
+    };
+    let out = nodes[0].handle_message(None, put("1"), 1).await.unwrap();
+    pump(&mut nodes, outbox(1, &out), &all).await;
+    let out = nodes[0].on_heartbeat_timeout().await.unwrap();
+    pump(&mut nodes, outbox(1, &out), &all).await;
+    assert_eq!(nodes[1].kv.get("x").map(String::as_str), Some("1"));
+
+    // Leader 1 heartbeats; node 2 answers, but the answer is delayed.
+    let hb = nodes[0].on_heartbeat_timeout().await.unwrap();
+    let to2 = sends(&hb)
+        .into_iter()
+        .find(|(to, m)| *to == 2 && matches!(m, Message::AppendEntries { .. }))
+        .unwrap()
+        .1;
+    let r = nodes[1].handle_message(Some(1), to2, 0).await.unwrap();
+    let delayed = sends(&r)
+        .into_iter()
+        .find(|(to, m)| *to == 1 && matches!(m, Message::AppendEntriesResponse { .. }))
+        .unwrap()
+        .1;
+
+    // Node 1 is cut off. Node 3 wins term 2 with node 2 and commits x=2.
+    let rest = [2u64, 3];
+    let out = nodes[2].on_election_timeout().await.unwrap();
+    pump(&mut nodes, outbox(3, &out), &rest).await;
+    assert_eq!(nodes[2].volatile.role, Role::Leader);
+    let out = nodes[2].handle_message(None, put("2"), 1).await.unwrap();
+    pump(&mut nodes, outbox(3, &out), &rest).await;
+    let out = nodes[2].on_heartbeat_timeout().await.unwrap();
+    pump(&mut nodes, outbox(3, &out), &rest).await;
+    assert_eq!(nodes[2].kv.get("x").map(String::as_str), Some("2"));
+
+    // The write completed. Now a client reads on the deposed leader 1.
+    assert_eq!(nodes[0].volatile.role, Role::Leader, "1 has not noticed");
+    let out = nodes[0]
+        .handle_message(
+            None,
+            Message::Client(ClientRequest::Get { key: "x".into() }),
+            77,
+        )
+        .await
+        .unwrap();
+    let mut replies: Vec<Outbound> = out;
+    replies.extend(nodes[0].handle_message(Some(2), delayed, 0).await.unwrap());
+    let stale = replies
+        .iter()
+        .any(|o| matches!(o, Outbound::ClientReply { corr: 77, resp } if resp.ok));
+    assert!(
+        !stale,
+        "deposed leader served a read with an ack sent before the read: {replies:?}"
+    );
+}
