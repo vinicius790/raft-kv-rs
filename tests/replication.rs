@@ -16,7 +16,7 @@ fn fast_timing() -> TimingConfig {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn put_get_replicated() {
     let dir = tempfile::tempdir().unwrap();
-    let handles = spawn_cluster(17_200, dir.path().to_path_buf(), fast_timing())
+    let handles = spawn_cluster(0, dir.path().to_path_buf(), fast_timing())
         .await
         .expect("cluster");
     let leader = wait_for_leader(&handles, Duration::from_secs(5))
@@ -59,7 +59,7 @@ async fn put_get_replicated() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn follower_redirects_put() {
     let dir = tempfile::tempdir().unwrap();
-    let handles = spawn_cluster(17_210, dir.path().to_path_buf(), fast_timing())
+    let handles = spawn_cluster(0, dir.path().to_path_buf(), fast_timing())
         .await
         .expect("cluster");
     let leader = wait_for_leader(&handles, Duration::from_secs(5))
