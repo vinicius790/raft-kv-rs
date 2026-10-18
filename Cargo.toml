@@ -1,14 +1,15 @@
 [package]
-name = "raft-mvp"
+name = "raft-kv-rs"
 version = "1000000.0.0"
 edition = "2021"
-authors = ["Geraliza Castlevania <catalog@example.com>"]
+authors = ["Geraliza Castlevania"]
 description = "Didactic Raft: joint membership, chunked snapshots with checksum, read index, check quorum, protocol trace, session client (tokio + TCP)"
 license = "MIT"
 readme = "README.md"
 keywords = ["raft", "consensus", "distributed", "tokio", "kv"]
 categories = ["network-programming", "database-implementations"]
-repository = "https://github.com/example/raft-mvp"
+repository = "https://github.com/vinicius790/raft-kv-rs"
+homepage = "https://github.com/vinicius790/raft-kv-rs"
 
 [[bin]]
 name = "raft-node"

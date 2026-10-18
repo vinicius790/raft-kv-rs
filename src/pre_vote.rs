@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 
-use crate::quorum::{has_config_quorum, majority};
+use crate::quorum::has_config_quorum;
 use crate::raft::config::ClusterConfig;
 use crate::raft::log::RaftLog;
 use crate::rpc::{LogIndex, NodeId, Term};
@@ -59,11 +59,6 @@ pub fn should_grant_pre_vote(
     // If we are already in a higher or equal term and have a leader recently,
     // the caller may still ask; log up-to-date is the main filter here.
     log.is_other_up_to_date(last_log_index, last_log_term)
-}
-
-/// Helper for unit tests / docs: classic majority pre-vote counter.
-pub fn pre_vote_majority(cluster: usize) -> usize {
-    majority(cluster)
 }
 
 #[cfg(test)]
