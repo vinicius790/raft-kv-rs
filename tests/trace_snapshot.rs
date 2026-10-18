@@ -1,10 +1,10 @@
 //! Snapshot checksum refusal and the in-process protocol trace.
 //! Plus one simulator partition that is not in the 1..=80 property loop.
 
-use raft_mvp::raft::{Outbound, RaftCore, Role, TimingConfig};
-use raft_mvp::rpc::{ClientRequest, Message};
-use raft_mvp::sim::Sim;
-use raft_mvp::storage::{self, Storage};
+use raft_kv_rs::raft::{Outbound, RaftCore, Role, TimingConfig};
+use raft_kv_rs::rpc::{ClientRequest, Message};
+use raft_kv_rs::sim::Sim;
+use raft_kv_rs::storage::{self, Storage};
 
 fn timing() -> TimingConfig {
     TimingConfig {

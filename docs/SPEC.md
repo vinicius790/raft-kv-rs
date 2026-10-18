@@ -1,4 +1,4 @@
-# Especificação — raft-mvp 1000000.0.0
+# Especificação — raft-kv-rs 1000000.0.0
 
 Implementação didática de Raft (Ongaro & Ousterhout) em Rust. Este documento descreve o que o código faz e o que **não** promete. Não há números de throughput, latência ou tempo de eleição inventados. Timeouts padrão estão em `TECNOLOGIAS.md`; testes de integração encurtam esses intervalos de propósito.
 

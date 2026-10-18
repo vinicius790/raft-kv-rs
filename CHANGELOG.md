@@ -4,6 +4,11 @@ O formato segue o espírito de Keep a Changelog: versão, data, o que entrou e o
 
 ## Não lançado
 
+### Mudou
+
+- Crate renomeado de `raft-mvp` para `raft-kv-rs`, igual ao repositório. O binário continua `raft-node`. Quem importa a biblioteca troca `raft_mvp::` por `raft_kv_rs::`; o filtro de log padrão da CLI passa a ser `raft_kv_rs=info`.
+- `Cargo.toml`: `repository`/`homepage` apontam para https://github.com/vinicius790/raft-kv-rs e o e-mail placeholder saiu de `authors`.
+- Formato em disco (`raft-state.bin`, versão 1) e protocolo de rede não mudaram.
 ### Corrigido
 
 - Read index podia devolver valor velho (tese do Raft, §6.4). (1) Um líder recém-eleito respondia antes de commitar o noop do próprio termo, com `commit_index` atrasado. (2) Ack de um heartbeat enviado **antes** da leitura contava como confirmação de liderança. Agora a leitura espera o noop do termo commitado e um quorum de respostas da rodada aberta por ela. Testes: `read_index_waits_for_noop_of_current_term`, `read_index_ignores_acks_from_earlier_round`.
