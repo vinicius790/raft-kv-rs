@@ -36,7 +36,7 @@ struct PendingPut {
     oneshot: Option<oneshot::Sender<ClientResponse>>,
     read_key: Option<String>,
     read_term: u64,
-    /// Term in which the leader appended the entry at `wait_index`.
+    /// Term of the entry at `wait_index` when the Put started waiting on it.
     append_term: u64,
 }
 
@@ -320,11 +320,13 @@ async fn run_loop(
             _ = &mut election => {
                 let out = core.on_election_timeout().await?;
                 apply_outbound(&mut core, &peers, out, &mut election, &mut heartbeat, &mut pending, &mut corr_replies).await;
+                flush_pending_commits(&core, &mut pending, &mut corr_replies).await;
                 core.maybe_auto_snapshot().await?;
             }
             _ = &mut heartbeat => {
                 let out = core.on_heartbeat_timeout().await?;
                 apply_outbound(&mut core, &peers, out, &mut election, &mut heartbeat, &mut pending, &mut corr_replies).await;
+                flush_pending_commits(&core, &mut pending, &mut corr_replies).await;
                 core.maybe_auto_snapshot().await?;
             }
             Some(inbound) = inbound_rx.recv() => {
@@ -345,8 +347,8 @@ async fn run_loop(
                 }
                 let out = core.handle_message(inbound.from, inbound.msg, corr).await?;
                 apply_outbound(&mut core, &peers, out, &mut election, &mut heartbeat, &mut pending, &mut corr_replies).await;
-                core.maybe_auto_snapshot().await?;
                 flush_pending_commits(&core, &mut pending, &mut corr_replies).await;
+                core.maybe_auto_snapshot().await?;
             }
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
@@ -374,8 +376,8 @@ async fn run_loop(
                         });
                         let out = core.handle_message(None, Message::Client(req), corr).await?;
                         apply_outbound(&mut core, &peers, out, &mut election, &mut heartbeat, &mut pending, &mut corr_replies).await;
-                        core.maybe_auto_snapshot().await?;
                         flush_pending_commits(&core, &mut pending, &mut corr_replies).await;
+                        core.maybe_auto_snapshot().await?;
                     }
                 }
             }
@@ -417,9 +419,13 @@ async fn apply_outbound(
             Outbound::ClientWaitCommit { corr, wait_index } => {
                 if let Some(mut p) = corr_replies.remove(&corr) {
                     p.wait_index = wait_index;
-                    // Emitted by the same handler that appended the entry, so
-                    // the current term is the entry's term.
-                    p.append_term = core.persistent.current_term;
+                    // The entry is in our log right now (just appended, or an
+                    // in-flight session retry); remember whose entry it is.
+                    p.append_term = core
+                        .persistent
+                        .log
+                        .term_at(wait_index)
+                        .unwrap_or(core.persistent.current_term);
                     pending.push(p);
                 }
             }
@@ -476,23 +482,30 @@ async fn flush_pending_commits(
 ) {
     let commit = core.commit_index();
     let mut still = Vec::new();
+    let log = &core.persistent.log;
     for mut p in pending.drain(..) {
         if p.wait_index == 0 {
             still.push(p);
             continue;
         }
-        // The slot may have been overwritten by a later leader (Raft §5.3):
-        // committing *an* entry at `wait_index` is not committing *ours*.
-        // `None` means the index was compacted into a snapshot; compaction
-        // only covers committed entries, and an overwrite would have been
-        // seen here first, so it is treated as ours.
-        let term_now = core.persistent.log.term_at(p.wait_index);
-        if term_now.is_some_and(|t| t != p.append_term) {
-            deliver_client(&mut p, ClientResponse::not_leader(core.volatile.leader_id)).await;
-        } else if commit >= p.wait_index {
-            deliver_client(&mut p, ClientResponse::ok_put()).await;
-        } else {
-            still.push(p);
+        // Raft §5.3: a later leader may overwrite our slot. Committing *an*
+        // entry at `wait_index` is not committing *ours*, so only ack while
+        // the slot still holds the term the Put was appended in.
+        match log.term_at(p.wait_index) {
+            Some(t) if t != p.append_term => {
+                let hint = core.volatile.leader_id.filter(|&l| l != core.id);
+                deliver_client(&mut p, ClientResponse::not_leader(hint)).await;
+            }
+            Some(_) if commit >= p.wait_index => {
+                deliver_client(&mut p, ClientResponse::ok_put()).await;
+            }
+            // Slot replaced by an InstallSnapshot before we saw it commit:
+            // the outcome is unknown, so do not claim success.
+            None if p.wait_index <= log.snapshot_index => {
+                let hint = core.volatile.leader_id.filter(|&l| l != core.id);
+                deliver_client(&mut p, ClientResponse::not_leader(hint)).await;
+            }
+            _ => still.push(p),
         }
     }
     *pending = still;
