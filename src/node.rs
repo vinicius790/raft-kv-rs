@@ -14,7 +14,7 @@ use tracing::{info, warn};
 use crate::raft::{Outbound, RaftCore, Role, TimingConfig};
 use crate::rpc::{ClientRequest, ClientResponse, LogIndex, Message, NodeId, NodeStatus};
 use crate::storage::Storage;
-use crate::transport::{self, Inbound, PeerMap};
+use crate::transport::{self, Inbound, PeerMap, PeerPool, PoolConfig};
 
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
@@ -253,7 +253,11 @@ pub async fn spawn_node(cfg: NodeConfig) -> anyhow::Result<NodeHandle> {
         .copied()
         .filter(|id| !learners.contains(id))
         .collect();
-    let peers = PeerMap::new(cfg.peers.clone());
+    let peers = PeerPool::new(
+        cfg.id,
+        PeerMap::new(cfg.peers.clone()),
+        PoolConfig::default(),
+    );
 
     let storage = Storage::open(&cfg.data_dir).await?;
     let mut core =
@@ -288,7 +292,7 @@ pub async fn spawn_node(cfg: NodeConfig) -> anyhow::Result<NodeHandle> {
 
 async fn run_loop(
     mut core: RaftCore,
-    peers: PeerMap,
+    peers: PeerPool,
     mut inbound_rx: mpsc::Receiver<Inbound>,
     mut cmd_rx: mpsc::Receiver<NodeCmd>,
     mut shutdown_rx: oneshot::Receiver<()>,
@@ -323,6 +327,9 @@ async fn run_loop(
             }
             Some(inbound) = inbound_rx.recv() => {
                 let corr = corr_gen.fetch_add(1, Ordering::Relaxed);
+                if let Some(from) = inbound.from {
+                    peers.mark_alive(from).await;
+                }
                 if let Some(reply) = inbound.reply {
                     corr_replies.insert(corr, PendingPut {
                         corr,
@@ -375,20 +382,24 @@ async fn run_loop(
 
 async fn apply_outbound(
     core: &mut RaftCore,
-    peers: &PeerMap,
+    peers: &PeerPool,
     out: Vec<Outbound>,
     election: &mut std::pin::Pin<&mut tokio::time::Sleep>,
     heartbeat: &mut std::pin::Pin<&mut tokio::time::Sleep>,
     pending: &mut Vec<PendingPut>,
     corr_replies: &mut HashMap<u64, PendingPut>,
 ) {
+    if core.is_leader() {
+        // New term as leader: dial every peer now so the first AppendEntries
+        // (which announces the leader) is not dropped by an old dial backoff.
+        peers.on_leader_term(core.persistent.current_term).await;
+    }
     for ob in out {
         match ob {
             Outbound::Send { to, msg } => {
                 let peers = peers.clone();
-                let from = core.id;
                 tokio::spawn(async move {
-                    let _ = transport::send_peer_message(&peers, to, from, msg).await;
+                    let _ = peers.send(to, &msg).await;
                 });
             }
             Outbound::ClientReply { corr, resp } => {
@@ -508,21 +519,23 @@ async fn deliver_client(p: &mut PendingPut, resp: ClientResponse) {
 }
 
 /// Convenience: spawn a local 3-node cluster for tests/demos.
+///
+/// `base_port = 0` picks three free ephemeral ports (safe for parallel test
+/// runs); otherwise nodes listen on `base_port..base_port+3`.
 pub async fn spawn_cluster(
     base_port: u16,
     data_root: PathBuf,
     timing: TimingConfig,
 ) -> anyhow::Result<Vec<NodeHandle>> {
-    let addrs: Vec<(NodeId, SocketAddr)> = (0..3)
-        .map(|i| {
-            (
-                (i + 1) as NodeId,
-                format!("127.0.0.1:{}", base_port + i as u16)
-                    .parse()
-                    .unwrap(),
-            )
-        })
-        .collect();
+    let mut addrs: Vec<(NodeId, SocketAddr)> = Vec::new();
+    for i in 0..3u16 {
+        let addr: SocketAddr = if base_port == 0 {
+            std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?
+        } else {
+            format!("127.0.0.1:{}", base_port + i).parse()?
+        };
+        addrs.push(((i + 1) as NodeId, addr));
+    }
 
     let mut handles = Vec::new();
     for (id, bind) in &addrs {
@@ -553,6 +566,24 @@ pub async fn wait_for_leader(handles: &[NodeHandle], timeout: Duration) -> Optio
         for h in handles {
             let st = h.status().await;
             if st.role == "Leader" {
+                // The leader learns it won before its first AppendEntries
+                // reaches the followers. Give that heartbeat a short grace
+                // window so callers see a cluster that agrees on the leader;
+                // unreachable nodes only cost the grace period.
+                let grace = tokio::time::Instant::now() + Duration::from_millis(300);
+                while tokio::time::Instant::now() < grace {
+                    let mut agreed = true;
+                    for o in handles {
+                        if o.status().await.leader != Some(st.id) {
+                            agreed = false;
+                            break;
+                        }
+                    }
+                    if agreed {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
                 return Some(st.id);
             }
         }
