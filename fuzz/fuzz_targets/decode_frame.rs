@@ -3,5 +3,5 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let _ = raft_mvp::rpc::decode_frame(data);
+    let _ = raft_kv_rs::rpc::decode_frame(data);
 });

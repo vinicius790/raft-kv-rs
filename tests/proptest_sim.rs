@@ -6,8 +6,8 @@
 
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
-use raft_mvp::rpc::{self, decode_frame, MAX_FRAME};
-use raft_mvp::sim::{self, Step};
+use raft_kv_rs::rpc::{self, decode_frame, MAX_FRAME};
+use raft_kv_rs::sim::{self, Step};
 
 fn step() -> impl Strategy<Value = Step> {
     prop_oneof![
