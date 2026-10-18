@@ -47,12 +47,15 @@ impl PeerMap {
     }
 }
 
+/// Largest frame payload accepted (and sent): 16 MiB.
+pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+
 /// Read one length-prefixed Raft `Message` frame.
 pub async fn read_frame(stream: &mut TcpStream) -> std::io::Result<Message> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 16 * 1024 * 1024 {
+    if len > MAX_FRAME_LEN {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "frame too large",
@@ -67,6 +70,13 @@ pub async fn read_frame(stream: &mut TcpStream) -> std::io::Result<Message> {
 pub async fn write_frame(stream: &mut TcpStream, msg: &Message) -> std::io::Result<()> {
     let bytes =
         rpc::encode(msg).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    // `encode` prepends the 4-byte length; the peer refuses payloads above the cap.
+    if bytes.len() - 4 > MAX_FRAME_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "frame too large",
+        ));
+    }
     stream.write_all(&bytes).await?;
     stream.flush().await?;
     Ok(())
@@ -82,6 +92,12 @@ struct PeerHello {
 }
 
 async fn write_raw(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
+    if payload.len() > MAX_FRAME_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "frame too large",
+        ));
+    }
     let mut out = Vec::with_capacity(4 + payload.len());
     out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     out.extend_from_slice(payload);
@@ -144,7 +160,7 @@ async fn handle_connection(
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 16 * 1024 * 1024 {
+    if len > MAX_FRAME_LEN {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "frame too large",
@@ -205,5 +221,41 @@ pub async fn client_request(
             std::io::ErrorKind::TimedOut,
             "client request",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rpc::ClientRequest;
+
+    /// Regression: the sender must refuse a frame the receiver would reject
+    /// (> 16 MiB) instead of pushing it onto the socket.
+    #[tokio::test]
+    async fn write_frame_refuses_frame_over_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sink = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 64 * 1024];
+            while let Ok(n) = s.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let big = Message::Client(ClientRequest::Put {
+            key: "k".into(),
+            value: "x".repeat(16 * 1024 * 1024 + 1),
+        });
+        let err = write_frame(&mut stream, &big)
+            .await
+            .expect_err("oversized frame was sent");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let small = Message::Client(ClientRequest::Get { key: "k".into() });
+        write_frame(&mut stream, &small).await.unwrap();
+        drop(stream);
+        sink.await.unwrap();
     }
 }
