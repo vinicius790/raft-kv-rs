@@ -141,8 +141,11 @@ impl RaftLog {
             self.snapshot_term = last_included_term;
             return;
         }
-        if last_included < self.last_index() {
-            // Keep suffix after last_included if present.
+        // Raft Fig. 13 step 6: retain the suffix only if the entry at
+        // last_included matches the snapshot's term; otherwise discard it all.
+        let same_entry = self.term_at(last_included) == Some(last_included_term);
+        if last_included < self.last_index() && same_entry {
+            // Keep suffix after last_included.
             let drop = (last_included - self.snapshot_index) as usize;
             if drop <= self.entries.len() {
                 self.entries.drain(..drop);
@@ -303,5 +306,35 @@ mod tests {
         assert_eq!(log.term_at(3), Some(1));
         assert!(log.entry(2).is_none());
         assert!(log.entry(4).is_some());
+    }
+
+    /// Regression (Raft Fig. 13, step 6): keep the suffix only when the entry
+    /// at last_included has the snapshot's index AND term.
+    #[test]
+    fn install_snapshot_discards_suffix_when_term_differs() {
+        let entries = |log: &mut RaftLog, term| {
+            for i in 1..=4 {
+                log.append(LogEntry {
+                    term,
+                    command: Command::Put {
+                        key: format!("k{i}"),
+                        value: format!("t{term}"),
+                    },
+                });
+            }
+        };
+        let mut stale = RaftLog::new();
+        entries(&mut stale, 1);
+        stale.install_snapshot(2, 2);
+        assert_eq!(stale.snapshot_index, 2);
+        assert_eq!(stale.snapshot_term, 2);
+        assert_eq!(stale.last_index(), 2, "suffix from another term kept");
+        assert!(stale.entry(3).is_none());
+
+        let mut same = RaftLog::new();
+        entries(&mut same, 2);
+        same.install_snapshot(2, 2);
+        assert_eq!(same.last_index(), 4, "matching suffix must be kept");
+        assert_eq!(same.term_at(3), Some(2));
     }
 }
