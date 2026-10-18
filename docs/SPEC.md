@@ -20,7 +20,7 @@ O log é 1-indexado. Depois de um snapshot, `snapshot_index` substitui o prefixo
 4. Nó isolado não consegue quorum de pre-vote contra um líder saudável: o termo do líder não sobe.
 5. Cluster de um voter: o timeout elege (ou mantém) o líder local. Timeout **enquanto já é líder** não faz nada. Proposta que tire esse único voter do conjunto é recusada.
 
-`TimeoutNow` (transferência de liderança) **passa por pre-vote**. O alvo não grava termo nem voto enquanto o pre-vote não tiver quorum. Se o pre-vote perde, o termo do alvo não sobe. Pre-vote pode ser desligado (`enable_pre_vote = false`) só em testes que injetam `RequestVote` direto.
+`TimeoutNow` (transferência de liderança) **não passa por pre-vote** (modelo do etcd): os outros followers ainda ouvem o líder antigo e recusariam o pre-vote, então com 5+ voters a transferência nunca venceria. O alvo sobe o termo e manda `RequestVote` direto; o voto continua exigindo log em dia. `TimeoutNow` de termo antigo é ignorado. Pre-vote pode ser desligado (`enable_pre_vote = false`) só em testes que injetam `RequestVote` direto.
 
 ## Replicação, lote e pipeline
 
@@ -57,7 +57,7 @@ Ao instalar, o follower só mantém as entradas depois de `last_included_index` 
 
 Snapshot com `last_included_index <= commitIndex` do follower é velho: o follower responde `success`/`done` (o líder avança `matchIndex`) e **não** troca KV, log nem config, para o KV não voltar no tempo.
 
-O frame TCP continua com teto de 16 MiB. Uma fatia não deve passar desse teto.
+O frame TCP continua com teto de 16 MiB (`transport::MAX_FRAME`), checado na leitura **e** na escrita: `Frame::write` devolve `InvalidData` em vez de mandar um frame que o outro lado recusaria. Uma fatia não deve passar desse teto.
 
 ## Read index
 
@@ -67,7 +67,7 @@ O frame TCP continua com teto de 16 MiB. Uma fatia não deve passar desse teto.
 
 ## Transferência de liderança
 
-`TransferLeadership { target }` só envia `TimeoutNow` depois de `matchIndex[target] >= lastLogIndex`, e o líder então desce. O alvo começa **pre-vote**; só com quorum é que o termo sobe e sai `RequestVote`. O novo líder carrega o mesmo prefixo commitado. Alvo que não é voter é recusado.
+`TransferLeadership { target }` só envia `TimeoutNow` depois de `matchIndex[target] >= lastLogIndex`, e o líder então desce. O alvo sobe o termo e sai `RequestVote` na hora, sem pre-vote. O novo líder carrega o mesmo prefixo commitado. Alvo que não é voter é recusado.
 
 ## Sessão de cliente
 
@@ -113,7 +113,7 @@ O crc é calculado no crate (`storage::crc32`). Não há dependência extra para
 
 ## Check-quorum (1.1)
 
-No líder TCP, `contact` inclui o próprio id e peers que ack de `AppendEntries` ou de `InstallSnapshot` com `done`. O conjunto do read index é outro e continua sendo zerado a cada `Get`.
+No líder TCP, `contact` inclui o próprio id e peers que ack de `AppendEntries` ou de `InstallSnapshot` com `done`. O conjunto do read index é outro e continua sendo zerado a cada `Get`. Ack **não** rearma o timer de check-quorum: a janela é fixa (`check_quorum_timeout`), rearmada só pela própria checagem. Assim um líder isolado logo depois de um ack desce na checagem seguinte, sem ganhar uma janela extra.
 
 Se `on_election_timeout` corre no líder e `contact` não forma quorum da config, o líder vira follower e **não** incrementa `currentTerm`. A janela armada pelo processo é `4 * election_max_ms`. Heartbeat sem ack não reinicia a janela; ack que completa o quorum reinicia. `enable_check_quorum = false` restaura o comportamento antigo (líder ignora o timeout).
 
