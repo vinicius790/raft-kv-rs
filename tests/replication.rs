@@ -4,9 +4,10 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use raft_kv_rs::node::{
-    get_redirect, put_redirect, spawn_cluster, spawn_node, wait_for_leader, NodeConfig, NodeHandle,
-};
+mod common;
+
+use common::{ephemeral_addrs, get_ok, put_ok, spawn_cluster};
+use raft_kv_rs::node::{spawn_node, wait_for_leader, NodeConfig, NodeHandle};
 use raft_kv_rs::raft::TimingConfig;
 
 fn fast_timing() -> TimingConfig {
@@ -20,18 +21,18 @@ fn fast_timing() -> TimingConfig {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn put_get_replicated() {
     let dir = tempfile::tempdir().unwrap();
-    let handles = spawn_cluster(0, dir.path().to_path_buf(), fast_timing())
+    let handles = spawn_cluster(dir.path(), fast_timing())
         .await
         .expect("cluster");
     let leader = wait_for_leader(&handles, Duration::from_secs(5))
         .await
         .expect("leader");
 
-    let resp = put_redirect(&handles, leader, "alpha", "1").await;
+    let resp = put_ok(&handles, leader, "alpha", "1").await;
     assert!(resp.ok, "put failed: {:?}", resp.error);
 
     // Read from leader
-    let got = get_redirect(&handles, leader, "alpha").await;
+    let got = get_ok(&handles, leader, "alpha").await;
     assert!(got.ok, "get failed: {:?}", got.error);
     assert_eq!(got.value.as_deref(), Some("1"));
 
@@ -50,9 +51,9 @@ async fn put_get_replicated() {
     assert!(st.kv_len >= 1, "kv_len={}", st.kv_len);
 
     // Overwrite
-    let resp2 = put_redirect(&handles, leader, "alpha", "2").await;
+    let resp2 = put_ok(&handles, leader, "alpha", "2").await;
     assert!(resp2.ok);
-    let got2 = get_redirect(&handles, leader, "alpha").await;
+    let got2 = get_ok(&handles, leader, "alpha").await;
     assert_eq!(got2.value.as_deref(), Some("2"));
 
     for h in handles {
@@ -63,7 +64,7 @@ async fn put_get_replicated() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn follower_redirects_put() {
     let dir = tempfile::tempdir().unwrap();
-    let handles = spawn_cluster(0, dir.path().to_path_buf(), fast_timing())
+    let handles = spawn_cluster(dir.path(), fast_timing())
         .await
         .expect("cluster");
     let leader = wait_for_leader(&handles, Duration::from_secs(5))
@@ -76,7 +77,7 @@ async fn follower_redirects_put() {
     assert_eq!(direct.leader_hint, Some(leader));
 
     // Redirect helper should still succeed
-    let ok = put_redirect(&handles, follower.id, "k", "v").await;
+    let ok = put_ok(&handles, follower.id, "k", "v").await;
     assert!(ok.ok, "{:?}", ok.error);
 
     for h in handles {
@@ -91,15 +92,7 @@ async fn follower_redirects_put() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deposed_leader_does_not_ack_overwritten_put() {
     let dir = tempfile::tempdir().unwrap();
-    let addrs: HashMap<u64, SocketAddr> = (1..=3u64)
-        .map(|i| {
-            let a = std::net::TcpListener::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap();
-            (i, a)
-        })
-        .collect();
+    let addrs: HashMap<u64, SocketAddr> = ephemeral_addrs(3).into_iter().collect();
     let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
     // Peer map for `id`; links touching `cut` point at a dead address.
     let peers_of = |id: u64, cut: Option<u64>| -> HashMap<u64, SocketAddr> {
