@@ -20,7 +20,7 @@ O log é 1-indexado. Depois de um snapshot, `snapshot_index` substitui o prefixo
 4. Nó isolado não consegue quorum de pre-vote contra um líder saudável: o termo do líder não sobe.
 5. Cluster de um voter: o timeout elege (ou mantém) o líder local. Timeout **enquanto já é líder** não faz nada. Proposta que tire esse único voter do conjunto é recusada.
 
-`TimeoutNow` (transferência de liderança) **passa por pre-vote**. O alvo não grava termo nem voto enquanto o pre-vote não tiver quorum. Se o pre-vote perde, o termo do alvo não sobe. Pre-vote pode ser desligado (`enable_pre_vote = false`) só em testes que injetam `RequestVote` direto.
+`TimeoutNow` (transferência de liderança) **não passa por pre-vote** (modelo do etcd): os outros followers ainda ouvem o líder antigo e recusariam o pre-vote, então com 5+ voters a transferência nunca venceria. O alvo sobe o termo e manda `RequestVote` direto; o voto continua exigindo log em dia. `TimeoutNow` de termo antigo é ignorado. Pre-vote pode ser desligado (`enable_pre_vote = false`) só em testes que injetam `RequestVote` direto.
 
 ## Replicação, lote e pipeline
 
@@ -67,7 +67,7 @@ O frame TCP continua com teto de 16 MiB. Uma fatia não deve passar desse teto.
 
 ## Transferência de liderança
 
-`TransferLeadership { target }` só envia `TimeoutNow` depois de `matchIndex[target] >= lastLogIndex`, e o líder então desce. O alvo começa **pre-vote**; só com quorum é que o termo sobe e sai `RequestVote`. O novo líder carrega o mesmo prefixo commitado. Alvo que não é voter é recusado.
+`TransferLeadership { target }` só envia `TimeoutNow` depois de `matchIndex[target] >= lastLogIndex`, e o líder então desce. O alvo sobe o termo e sai `RequestVote` na hora, sem pre-vote. O novo líder carrega o mesmo prefixo commitado. Alvo que não é voter é recusado.
 
 ## Sessão de cliente
 

@@ -1606,13 +1606,13 @@ impl RaftCore {
         if !self.persistent.config.is_voter(self.id) {
             return Ok(vec![]);
         }
-        // TimeoutNow campaigns through pre-vote. A lost pre-vote must not bump term.
+        // Leadership transfer (thesis §3.10, etcd `campaignTransfer`): skip
+        // pre-vote. Bystanders still hear the old leader and would refuse a
+        // pre-vote, so with 5+ voters the transfer could never win. The old
+        // leader already stepped down; RequestVote applies the normal up-to-date
+        // log check.
         self.heard_from_leader = false;
-        if self.enable_pre_vote {
-            self.start_pre_vote().await
-        } else {
-            self.start_election().await
-        }
+        self.start_election().await
     }
 
     fn refresh_role_from_config(&mut self) {
