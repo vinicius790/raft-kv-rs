@@ -55,7 +55,7 @@ Papel `Learner`: recebe AppendEntries e InstallSnapshot, não vota, não inicia 
 
 Snapshot com `last_included_index <= commitIndex` do follower é velho: o follower responde `success`/`done` (o líder avança `matchIndex`) e **não** troca KV, log nem config, para o KV não voltar no tempo.
 
-O frame TCP continua com teto de 16 MiB. Uma fatia não deve passar desse teto.
+O frame TCP continua com teto de 16 MiB (`transport::MAX_FRAME_LEN`), checado na leitura **e** na escrita: `write_frame` devolve `InvalidInput` em vez de mandar um frame que o outro lado recusaria. Uma fatia não deve passar desse teto.
 
 ## Read index
 
