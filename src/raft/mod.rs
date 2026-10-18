@@ -1306,12 +1306,13 @@ impl RaftCore {
             }]);
         }
 
+        // Acks only fill `contact`; they never re-arm the check-quorum timer.
+        // Re-arming here pushed each check one window past the last ack, so a
+        // leader cut off right after an ack survived one extra window.
+        let commit_before = self.volatile.commit_index;
         let mut out = self.try_commit();
         out.extend(self.check_read_index_ready());
-        if self.quorum_contact() {
-            out.push(Outbound::ResetElectionTimer);
-        }
-        if !out.is_empty() {
+        if !out.is_empty() || self.volatile.commit_index != commit_before {
             self.persist().await?;
         }
         // Resume this peer if the ack freed in-flight budget. try_commit may
@@ -1571,17 +1572,8 @@ impl RaftCore {
         }
         let mut out = self.try_commit();
         out.extend(self.check_read_index_ready());
-        if self.quorum_contact() {
-            out.push(Outbound::ResetElectionTimer);
-        }
         out.extend(self.replicate_peer(peer, false));
         Ok(out)
-    }
-
-    fn quorum_contact(&self) -> bool {
-        self.leader
-            .as_ref()
-            .is_some_and(|l| has_config_quorum(&self.persistent.config, &l.contact))
     }
 
     async fn handle_timeout_now(

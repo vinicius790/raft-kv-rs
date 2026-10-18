@@ -324,6 +324,7 @@ async fn check_quorum_window_is_not_extended_by_acks() {
                 match_index: li,
                 conflict_index: 0,
                 need_snapshot: false,
+                read_ctx: 0,
             },
             0,
         )
