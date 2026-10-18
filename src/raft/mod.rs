@@ -28,6 +28,10 @@ use replication::{advance_commit_index, log_matches};
 
 /// Max entries per AppendEntries (batching / pipeline).
 pub const MAX_APPEND_BATCH: usize = 64;
+/// Default cap on client Puts proposed together.
+pub const DEFAULT_CLIENT_BATCH: usize = 64;
+/// Default byte cap (key + value) of one client Put batch.
+pub const DEFAULT_CLIENT_BATCH_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct TimingConfig {
@@ -98,6 +102,11 @@ pub struct RaftCore {
     pub heard_from_leader: bool,
     /// How many AppendEntries batches may be outstanding to one peer.
     pub pipeline_window: usize,
+    /// Max client Puts the node loop folds into one proposal (one persist,
+    /// one replication round).
+    pub max_client_batch: usize,
+    /// Byte cap (key + value) for one client Put batch.
+    pub max_client_batch_bytes: usize,
     /// Pause replication to a peer once unacked AppendEntries bytes reach this.
     pub max_inflight_bytes: u64,
     /// InstallSnapshot chunk size in bytes. The follower installs only on `done`.
@@ -106,6 +115,10 @@ pub struct RaftCore {
     snap_cache: Option<SnapImage>,
     /// Follower-side assembly of a chunked snapshot. Log is untouched until done.
     snap_in: Option<IncomingSnap>,
+    /// Committed config at `snapshot_index` (bootstrap config if none). The
+    /// effective config is this plus every ChangeConfig left in the log. It is
+    /// what goes into the `config` field of raft-state.bin.
+    config_base: ClusterConfig,
     /// Volatile counters. Reset on process start; not written to disk.
     pub commits: u64,
     pub elections: u64,
@@ -155,6 +168,7 @@ impl RaftCore {
         if persistent.config.is_uninitialized() {
             persistent.config = ClusterConfig::bootstrap(id, &peers, &learners);
         }
+        let config_base = persistent.config.clone();
         let commit_index = storage.commit_index();
         let (snap_idx, snap_term, snap_kv, snap_sess) = storage.snapshot_meta();
         let mut kv = KvStore::new();
@@ -215,10 +229,13 @@ impl RaftCore {
             peer_addrs: HashMap::new(),
             heard_from_leader: false,
             pipeline_window: 8,
+            max_client_batch: DEFAULT_CLIENT_BATCH,
+            max_client_batch_bytes: DEFAULT_CLIENT_BATCH_BYTES,
             max_inflight_bytes: 1 << 20,
             snapshot_chunk_size: 1 << 20,
             snap_cache: None,
             snap_in: None,
+            config_base,
             commits: 0,
             elections: 0,
             snapshot_bytes: 0,
@@ -296,6 +313,11 @@ impl RaftCore {
         self.volatile.role == Role::Leader
     }
 
+    /// Durable state handle (simulator restarts reopen a core from it).
+    pub(crate) fn storage(&self) -> &Storage {
+        &self.storage
+    }
+
     pub fn commit_index(&self) -> LogIndex {
         self.volatile.commit_index
     }
@@ -309,18 +331,27 @@ impl RaftCore {
         self.peer_addrs = addrs;
     }
 
+    /// Disk keeps the base config; the log suffix rebuilds the effective one.
     async fn persist(&mut self) -> anyhow::Result<()> {
-        self.storage
+        let effective = std::mem::replace(&mut self.persistent.config, self.config_base.clone());
+        let res = self
+            .storage
             .save(&self.persistent, self.volatile.commit_index)
-            .await?;
+            .await;
+        self.persistent.config = effective;
+        res?;
         Ok(())
     }
 
     /// Persist vote/term first then log (for crash-between-writes tests).
     pub async fn persist_vote_then_log(&mut self) -> anyhow::Result<()> {
-        self.storage
+        let effective = std::mem::replace(&mut self.persistent.config, self.config_base.clone());
+        let res = self
+            .storage
             .save_vote_then_log(&self.persistent, self.volatile.commit_index)
-            .await?;
+            .await;
+        self.persistent.config = effective;
+        res?;
         Ok(())
     }
 
@@ -510,11 +541,27 @@ impl RaftCore {
         Ok(out)
     }
 
+    /// Go-back-N round: re-plan every peer from `next_index`, replacing its
+    /// in-flight window. Used on heartbeat ticks, leadership start and read
+    /// index rounds; it is what recovers lost AppendEntries.
     fn broadcast_append_entries(&mut self) -> Vec<Outbound> {
         let peers = self.peer_ids();
         let mut out = Vec::new();
         for peer in peers {
-            out.extend(self.replicate_peer(peer, true));
+            out.extend(self.replicate_peer_mode(peer, true, true));
+        }
+        out
+    }
+
+    /// Pipelined round: send only entries past what is already in flight to
+    /// each peer (bounded by `pipeline_window` / `max_inflight_bytes`). With
+    /// `allow_empty`, a peer with nothing new still gets an empty AppendEntries
+    /// carrying the current `leader_commit`.
+    fn broadcast_new_entries(&mut self, allow_empty: bool) -> Vec<Outbound> {
+        let peers = self.peer_ids();
+        let mut out = Vec::new();
+        for peer in peers {
+            out.extend(self.replicate_peer_mode(peer, allow_empty, false));
         }
         out
     }
@@ -522,6 +569,17 @@ impl RaftCore {
     /// Send the next pipelined AppendEntries batches, or the next snapshot chunk.
     /// `match_index` is not touched here — only an ack moves it.
     fn replicate_peer(&mut self, peer: NodeId, allow_empty_heartbeat: bool) -> Vec<Outbound> {
+        self.replicate_peer_mode(peer, allow_empty_heartbeat, false)
+    }
+
+    /// `fresh = true`: restart the window at `next_index` (retransmit).
+    /// `fresh = false`: keep the in-flight window and append after it.
+    fn replicate_peer_mode(
+        &mut self,
+        peer: NodeId,
+        allow_empty_heartbeat: bool,
+        fresh: bool,
+    ) -> Vec<Outbound> {
         if self.volatile.role != Role::Leader || self.leader.is_none() {
             return vec![];
         }
@@ -540,22 +598,30 @@ impl RaftCore {
 
         let cap = self.max_inflight_bytes.max(1);
         let window = self.pipeline_window.max(1);
-        let (already_bytes, already_n) = {
+        let (already_bytes, already_n, inflight_end) = {
             let leader = self.leader.as_ref().unwrap();
+            let q = leader.inflight.get(&peer);
             (
                 leader.inflight_bytes.get(&peer).copied().unwrap_or(0),
-                leader.inflight.get(&peer).map(|v| v.len()).unwrap_or(0),
+                q.map(|v| v.len()).unwrap_or(0),
+                q.and_then(|v| v.iter().map(|m| m.last_index).max()),
             )
         };
-        if already_n > 0 && already_bytes >= cap {
+        if !fresh && already_n > 0 && (already_bytes >= cap || already_n >= window) {
+            return self.flow_paused_heartbeat(peer, allow_empty_heartbeat);
+        }
+        if fresh && already_n > 0 && already_bytes >= cap {
             return self.flow_paused_heartbeat(peer, allow_empty_heartbeat);
         }
 
-        let mut cursor = next;
+        // Incremental mode continues after the last in-flight batch.
+        let (mut cursor, kept_n, mut bytes_acc) = match (fresh, inflight_end) {
+            (false, Some(end)) if end >= next => (end + 1, already_n, already_bytes),
+            _ => (next, 0, 0),
+        };
         let last = self.persistent.log.last_index();
         let mut planned: Vec<(LogIndex, u64)> = Vec::new();
-        let mut bytes_acc = 0u64;
-        while planned.len() < window && cursor <= last {
+        while kept_n + planned.len() < window && cursor <= last {
             let entries = self
                 .persistent
                 .log
@@ -564,7 +630,7 @@ impl RaftCore {
                 break;
             }
             let msg_bytes = bincode::serialized_size(&entries).unwrap_or(0);
-            if !planned.is_empty() && bytes_acc.saturating_add(msg_bytes) > cap {
+            if (kept_n > 0 || !planned.is_empty()) && bytes_acc.saturating_add(msg_bytes) > cap {
                 break;
             }
             let n = entries.len() as LogIndex;
@@ -599,7 +665,11 @@ impl RaftCore {
             out.push(Outbound::Send { to: peer, msg });
         }
         if let Some(leader) = self.leader.as_mut() {
-            leader.inflight.insert(peer, inflight);
+            if kept_n > 0 {
+                leader.inflight.entry(peer).or_default().extend(inflight);
+            } else {
+                leader.inflight.insert(peer, inflight);
+            }
             leader.inflight_bytes.insert(peer, bytes_acc);
         }
         if out.is_empty() {
@@ -681,12 +751,12 @@ impl RaftCore {
                 };
             }
         }
-        let blob = SnapshotBlob {
-            kv: self.kv.snapshot(),
-            sessions: self.kv.sessions_snapshot(),
-        };
+        // The image must be the state at `index`, not the live KV, which may
+        // already include entries after it. The durable snapshot is exactly that.
+        let (_, _, kv, sessions) = self.storage.snapshot_meta();
+        let blob = SnapshotBlob { kv, sessions };
         let data = bincode::serialize(&blob).unwrap_or_default();
-        let config = self.persistent.config.clone();
+        let config = self.config_base.clone();
         self.snap_cache = Some(SnapImage {
             index,
             term,
@@ -1137,13 +1207,9 @@ impl RaftCore {
 
         if !entries.is_empty() {
             self.persistent.log.append_entries(prev_log_index, &entries);
-            // Pick up config from any ChangeConfig in new entries.
-            for e in &entries {
-                if let Command::ChangeConfig(cfg) = &e.command {
-                    self.persistent.config = cfg.clone();
-                    self.refresh_role_from_config();
-                }
-            }
+            // Conflicting entries may have been truncated, ChangeConfig included:
+            // rebuild from the base, not from the config we had before.
+            self.recompute_config();
             self.persist().await?;
         }
 
@@ -1259,12 +1325,13 @@ impl RaftCore {
             }]);
         }
 
+        // Acks only fill `contact`; they never re-arm the check-quorum timer.
+        // Re-arming here pushed each check one window past the last ack, so a
+        // leader cut off right after an ack survived one extra window.
+        let commit_before = self.volatile.commit_index;
         let mut out = self.try_commit();
         out.extend(self.check_read_index_ready());
-        if self.quorum_contact() {
-            out.push(Outbound::ResetElectionTimer);
-        }
-        if !out.is_empty() {
+        if !out.is_empty() || self.volatile.commit_index != commit_before {
             self.persist().await?;
         }
         // Resume this peer if the ack freed in-flight budget. try_commit may
@@ -1425,8 +1492,8 @@ impl RaftCore {
         self.persistent
             .log
             .install_snapshot(incoming.index, incoming.term);
-        self.persistent.config = incoming.config.clone();
-        self.refresh_role_from_config();
+        self.config_base = incoming.config.clone();
+        self.recompute_config();
         self.snapshot_index = incoming.index;
         self.snapshot_term = incoming.term;
         self.snap_cache = None;
@@ -1524,17 +1591,8 @@ impl RaftCore {
         }
         let mut out = self.try_commit();
         out.extend(self.check_read_index_ready());
-        if self.quorum_contact() {
-            out.push(Outbound::ResetElectionTimer);
-        }
         out.extend(self.replicate_peer(peer, false));
         Ok(out)
-    }
-
-    fn quorum_contact(&self) -> bool {
-        self.leader
-            .as_ref()
-            .is_some_and(|l| has_config_quorum(&self.persistent.config, &l.contact))
     }
 
     async fn handle_timeout_now(
@@ -1548,13 +1606,13 @@ impl RaftCore {
         if !self.persistent.config.is_voter(self.id) {
             return Ok(vec![]);
         }
-        // TimeoutNow campaigns through pre-vote. A lost pre-vote must not bump term.
+        // Leadership transfer (thesis §3.10, etcd `campaignTransfer`): skip
+        // pre-vote. Bystanders still hear the old leader and would refuse a
+        // pre-vote, so with 5+ voters the transfer could never win. The old
+        // leader already stepped down; RequestVote applies the normal up-to-date
+        // log check.
         self.heard_from_leader = false;
-        if self.enable_pre_vote {
-            self.start_pre_vote().await
-        } else {
-            self.start_election().await
-        }
+        self.start_election().await
     }
 
     fn refresh_role_from_config(&mut self) {
@@ -1590,7 +1648,7 @@ impl RaftCore {
         }
         // Committed entries can be older than an uncommitted C_new already
         // stored in the log. The latest config entry wins, committed or not.
-        self.adopt_latest_config_from_log();
+        self.recompute_config();
         // Leader: if joint config committed, append C_new to leave joint.
         if self.volatile.role == Role::Leader {
             if let ClusterConfig::Joint { new, .. } = self.persistent.config.clone() {
@@ -1623,21 +1681,24 @@ impl RaftCore {
         }
     }
 
-    /// Latest ChangeConfig in the log, including entries that are not committed yet.
-    fn adopt_latest_config_from_log(&mut self) {
-        let last = self.persistent.log.last_index();
-        let mut found = None;
-        for i in 1..=last {
-            if let Some(e) = self.persistent.log.entry(i) {
-                if let Command::ChangeConfig(cfg) = &e.command {
-                    found = Some(cfg.clone());
-                }
+    /// Config in force after `index`: the base plus ChangeConfig entries in
+    /// `(snapshot_index, index]`.
+    fn config_at(&self, index: LogIndex) -> ClusterConfig {
+        let mut cfg = self.config_base.clone();
+        for i in self.persistent.log.first_index()..=index {
+            if let Some(Command::ChangeConfig(c)) = self.persistent.log.entry(i).map(|e| &e.command)
+            {
+                cfg = c.clone();
             }
         }
-        if let Some(cfg) = found {
-            self.persistent.config = cfg;
-            self.refresh_role_from_config();
-        }
+        cfg
+    }
+
+    /// Effective config: latest ChangeConfig in the log, committed or not,
+    /// falling back to the base config when the log suffix has none.
+    fn recompute_config(&mut self) {
+        self.persistent.config = self.config_at(self.persistent.log.last_index());
+        self.refresh_role_from_config();
     }
 
     fn try_leave_joint(&mut self) -> bool {
@@ -1676,6 +1737,44 @@ impl RaftCore {
         true
     }
 
+    /// Propose several plain Puts at once: one append run, one persist, one
+    /// pipelined replication round. Each Put is still acknowledged only when
+    /// its own index commits (commit rules unchanged).
+    pub async fn handle_put_batch(
+        &mut self,
+        puts: Vec<(u64, String, String)>,
+    ) -> anyhow::Result<Vec<Outbound>> {
+        if self.volatile.role != Role::Leader {
+            return Ok(puts
+                .into_iter()
+                .map(|(corr, _, _)| Outbound::ClientReply {
+                    corr,
+                    resp: ClientResponse::not_leader(self.volatile.leader_id),
+                })
+                .collect());
+        }
+        let mut out = Vec::with_capacity(puts.len() + 4);
+        let mut waits = Vec::with_capacity(puts.len());
+        for (corr, key, value) in puts {
+            self.persistent.log.append(LogEntry {
+                term: self.persistent.current_term,
+                command: Command::Put { key, value },
+            });
+            waits.push(Outbound::ClientWaitCommit {
+                corr,
+                wait_index: self.persistent.log.last_index(),
+            });
+        }
+        // Durable before any follower sees the entries.
+        self.persist().await?;
+        out.extend(self.broadcast_new_entries(false));
+        out.extend(self.try_commit());
+        self.persist().await?;
+        out.extend(waits);
+        out.push(Outbound::ResetHeartbeatTimer);
+        Ok(out)
+    }
+
     async fn handle_client(
         &mut self,
         req: ClientRequest,
@@ -1689,7 +1788,8 @@ impl RaftCore {
             | ClientRequest::SessionPut { .. }
             | ClientRequest::ChangeMembership { .. }
             | ClientRequest::TransferLeadership { .. }
-            | ClientRequest::PromoteLearner { .. } => {
+            | ClientRequest::PromoteLearner { .. }
+            | ClientRequest::Delete { .. } => {
                 if self.volatile.role != Role::Leader {
                     return Ok(vec![Outbound::ClientReply {
                         corr,
@@ -1735,10 +1835,15 @@ impl RaftCore {
                 out.push(Outbound::ResetHeartbeatTimer);
                 Ok(out)
             }
-            ClientRequest::Put { key, value } => {
+            ClientRequest::Put { .. } | ClientRequest::Delete { .. } => {
+                let command = match req {
+                    ClientRequest::Put { key, value } => Command::Put { key, value },
+                    ClientRequest::Delete { key } => Command::Delete { key },
+                    _ => unreachable!(),
+                };
                 self.persistent.log.append(LogEntry {
                     term: self.persistent.current_term,
-                    command: Command::Put { key, value },
+                    command,
                 });
                 self.persist().await?;
                 let wait_index = self.persistent.log.last_index();
@@ -2032,9 +2137,11 @@ impl RaftCore {
             self.apply_committed();
             if self.try_leave_joint() {
                 // Broadcast the C_new entry.
-                out.extend(self.broadcast_append_entries());
+                out.extend(self.broadcast_new_entries(false));
             }
-            out.extend(self.broadcast_append_entries());
+            // Followers learn the new commit index; entries already in flight
+            // are not resent.
+            out.extend(self.broadcast_new_entries(true));
         }
         out
     }
@@ -2083,9 +2190,11 @@ impl RaftCore {
         self.pending_reads.push((corr, key, read_term));
     }
 
-    /// Create a local snapshot compacting the log prefix through commit_index.
+    /// Create a local snapshot compacting the log prefix through
+    /// `min(retain_index, last_applied)`. Only applied (so committed) state and
+    /// the config committed at that index are written.
     pub async fn compact_log(&mut self, retain_index: LogIndex) -> anyhow::Result<()> {
-        let last_included = retain_index.min(self.volatile.commit_index);
+        let last_included = retain_index.min(self.volatile.last_applied);
         if last_included == 0 || last_included <= self.persistent.log.snapshot_index {
             return Ok(());
         }
@@ -2094,20 +2203,12 @@ impl RaftCore {
             .log
             .term_at(last_included)
             .unwrap_or(self.persistent.current_term);
-        // Ensure KV reflects applied state through last_included.
-        while self.volatile.last_applied < last_included.min(self.volatile.commit_index) {
-            self.volatile.last_applied += 1;
-            if let Some(e) = self.persistent.log.entry(self.volatile.last_applied) {
-                self.kv.apply(&e.command);
-            }
-        }
+        let image = self.kv_image_at(last_included);
+        let base = self.config_at(last_included);
         self.persistent.log.compact_through(last_included, term);
+        self.config_base = base;
         self.snapshot_index = last_included;
         self.snapshot_term = term;
-        let image = SnapshotBlob {
-            kv: self.kv.snapshot(),
-            sessions: self.kv.sessions_snapshot(),
-        };
         let image_bytes = bincode::serialized_size(&image).unwrap_or(0);
         self.snapshot_bytes = self.snapshot_bytes.saturating_add(image_bytes);
         self.snap_cache = None;
@@ -2120,13 +2221,35 @@ impl RaftCore {
                 image.sessions,
                 self.persistent.log.clone(),
                 self.volatile.commit_index,
-                self.persistent.config.clone(),
+                self.config_base.clone(),
                 self.persistent.current_term,
                 self.persistent.voted_for,
             )
             .await?;
         info!(node = self.id, last_included, "log compacted via snapshot");
         Ok(())
+    }
+
+    /// KV and sessions as of `index` (snapshot_index <= index <= last_applied).
+    fn kv_image_at(&self, index: LogIndex) -> SnapshotBlob {
+        if index == self.volatile.last_applied {
+            return SnapshotBlob {
+                kv: self.kv.snapshot(),
+                sessions: self.kv.sessions_snapshot(),
+            };
+        }
+        let (_, _, kv, sessions) = self.storage.snapshot_meta();
+        let mut img = KvStore::new();
+        img.restore_full(kv, sessions);
+        for i in self.persistent.log.first_index()..=index {
+            if let Some(e) = self.persistent.log.entry(i) {
+                img.apply(&e.command);
+            }
+        }
+        SnapshotBlob {
+            kv: img.snapshot(),
+            sessions: img.sessions_snapshot(),
+        }
     }
 
     /// Compact when the committed suffix since the last snapshot reaches
