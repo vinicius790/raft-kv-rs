@@ -395,33 +395,18 @@ async fn leadership_transfer_keeps_committed_prefix() {
         .handle_message(Some(1), timeout_now, 0)
         .await
         .unwrap();
-    assert_eq!(
-        follower.persistent.current_term, term_before_campaign,
-        "TimeoutNow must pre-vote before bumping the term"
-    );
-    let prevotes: Vec<_> = sends(&camp)
-        .into_iter()
-        .filter(|(_, m)| matches!(m, Message::PreVote { .. }))
-        .collect();
+    // Transfer skips pre-vote (etcd model): the target bumps its term at once.
+    assert_eq!(follower.persistent.current_term, term_before_campaign + 1);
     assert!(
-        !prevotes.is_empty(),
-        "TimeoutNow must go through pre-vote: {camp:?}"
+        !sends(&camp)
+            .iter()
+            .any(|(_, m)| matches!(m, Message::PreVote { .. })),
+        "TimeoutNow must campaign directly: {camp:?}"
     );
-    let mut campaign = Vec::new();
-    for (to, msg) in prevotes {
-        if to != 1 {
-            continue;
-        }
-        let resp = leader.handle_message(Some(2), msg, 0).await.unwrap();
-        for (_, m) in sends(&resp) {
-            let more = follower.handle_message(Some(1), m, 0).await.unwrap();
-            campaign.extend(sends(&more));
-        }
-    }
-    let rv = campaign
+    let rv = sends(&camp)
         .into_iter()
         .find(|(to, m)| *to == 1 && matches!(m, Message::RequestVote { .. }))
-        .expect("pre-vote quorum starts a real election")
+        .expect("TimeoutNow starts a real election")
         .1;
     let grant = leader.handle_message(Some(2), rv, 0).await.unwrap();
     let g = sends(&grant).into_iter().next().unwrap().1;
@@ -1347,50 +1332,41 @@ async fn default_get_blocked_on_partitioned_leader() {
 }
 
 #[tokio::test]
-async fn timeout_now_lost_prevote_does_not_bump_term() {
+async fn timeout_now_campaigns_without_pre_vote_and_ignores_stale_term() {
     let (_d, mut follower) = fresh(2, vec![1, 3]).await;
-    let term = follower.persistent.current_term;
-    let out = follower
+    let term = follower.persistent.current_term.max(1);
+    follower.persistent.current_term = term;
+    // Stale TimeoutNow (older term) is ignored.
+    let stale = follower
         .handle_message(
             Some(1),
             Message::TimeoutNow {
-                term: term.max(1),
+                term: term - 1,
                 leader_id: 1,
             },
             0,
         )
         .await
         .unwrap();
-    assert!(sends(&out)
-        .iter()
-        .any(|(_, m)| matches!(m, Message::PreVote { .. })));
+    assert!(sends(&stale).is_empty(), "{stale:?}");
+    assert_eq!(follower.persistent.current_term, term);
+    let out = follower
+        .handle_message(Some(1), Message::TimeoutNow { term, leader_id: 1 }, 0)
+        .await
+        .unwrap();
     assert!(
         !sends(&out)
             .iter()
-            .any(|(_, m)| matches!(m, Message::RequestVote { .. })),
-        "TimeoutNow must not skip pre-vote"
+            .any(|(_, m)| matches!(m, Message::PreVote { .. })),
+        "transfer must not go through pre-vote"
     );
-    assert_eq!(follower.persistent.current_term, term);
-    let next = term + 1;
-    for peer in [1u64, 3] {
-        follower
-            .handle_message(
-                Some(peer),
-                Message::PreVoteResponse {
-                    next_term: next,
-                    vote_granted: false,
-                },
-                0,
-            )
-            .await
-            .unwrap();
-    }
-    assert_eq!(
-        follower.persistent.current_term, term,
-        "lost pre-vote must not bump term"
-    );
-    assert_ne!(follower.volatile.role, Role::Leader);
-    assert_ne!(follower.volatile.role, Role::Candidate);
+    let voters: Vec<u64> = sends(&out)
+        .iter()
+        .filter(|(_, m)| matches!(m, Message::RequestVote { term: t, .. } if *t == term + 1))
+        .map(|(to, _)| *to)
+        .collect();
+    assert_eq!(voters.len(), 2, "{out:?}");
+    assert_eq!(follower.volatile.role, Role::Candidate);
 }
 
 #[tokio::test]
@@ -1665,5 +1641,43 @@ async fn deposed_leader_does_not_serve_read_with_ack_sent_before_read() {
     assert!(
         !stale,
         "deposed leader served a read with an ack sent before the read: {replies:?}"
+    );
+}
+
+async fn drain(sim: &mut Sim) {
+    let mut n = 0;
+    while sim.step_message().await {
+        n += 1;
+        assert!(n < 10_000, "message storm");
+    }
+}
+
+/// Regression: with 5 voters, the three bystanders still hear the old leader
+/// and refuse pre-vote. TimeoutNow must campaign directly (etcd model) so the
+/// transfer completes without waiting for an election timeout.
+#[tokio::test]
+async fn timeout_now_transfers_leadership_in_five_node_cluster() {
+    let mut sim = Sim::new(7, &[1, 2, 3, 4, 5]).await;
+    sim.timeout(1).await;
+    drain(&mut sim).await;
+    assert_eq!(sim.leader_id(), Some(1));
+    sim.heartbeat(1).await;
+    drain(&mut sim).await;
+    for id in [3u64, 4, 5] {
+        assert!(sim.nodes[&id].heard_from_leader, "node {id} follows 1");
+    }
+    let term = sim.nodes[&1].persistent.current_term;
+    let resp = sim
+        .client(1, ClientRequest::TransferLeadership { target: 2 })
+        .await
+        .expect("reply");
+    assert!(resp.ok, "{resp:?}");
+    drain(&mut sim).await;
+    assert_eq!(sim.leader_id(), Some(2), "transfer did not complete");
+    assert_eq!(sim.nodes[&2].persistent.current_term, term + 1);
+    assert!(
+        sim.safety_violations.is_empty(),
+        "{:?}",
+        sim.safety_violations
     );
 }
