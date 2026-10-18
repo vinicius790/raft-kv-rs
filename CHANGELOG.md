@@ -12,6 +12,7 @@ O formato segue o espírito de Keep a Changelog: versão, data, o que entrou e o
 
 - **Quebra de compatibilidade de rede: campo read_ctx; atualizar todos os nós juntos; formato em disco inalterado.**
 - `AppendEntries` e `AppendEntriesResponse` ganharam o campo `read_ctx: u64` (o follower ecoa). O frame bincode muda: nós desta versão não conversam com nós da anterior; atualize o cluster inteiro de uma vez. `raft-state.bin` não mudou.
+- CI: o `uses:` do `Swatinem/rust-cache` tinha um SHA de 39 caracteres, que não existe, e o job falhava antes de rodar fmt/clippy/test. Agora aponta para o commit completo da tag `v2.9.2` (`6323deb102c322ba6fcbdcafc7e3dddab59af2b6`, conferido com `git ls-remote`).
 
 ## 1000000.0.0 — 2026-10-03
 
