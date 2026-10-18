@@ -1,5 +1,7 @@
 //! Stretch: a minority partition must not commit (no split-brain commit).
 
+mod common;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -15,15 +17,8 @@ fn fast_timing() -> TimingConfig {
     }
 }
 
-async fn spawn_three(base: u16, root: &std::path::Path) -> Vec<NodeHandle> {
-    let addrs: Vec<(u64, SocketAddr)> = (0..3)
-        .map(|i| {
-            (
-                (i + 1) as u64,
-                format!("127.0.0.1:{}", base + i as u16).parse().unwrap(),
-            )
-        })
-        .collect();
+async fn spawn_three(root: &std::path::Path) -> Vec<NodeHandle> {
+    let addrs: Vec<(u64, SocketAddr)> = common::ephemeral_addrs(3);
     let mut handles = Vec::new();
     for (id, bind) in &addrs {
         let mut peers = HashMap::new();
@@ -49,7 +44,7 @@ async fn spawn_three(base: u16, root: &std::path::Path) -> Vec<NodeHandle> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn minority_put_does_not_commit() {
     let dir = tempfile::tempdir().unwrap();
-    let mut handles = spawn_three(17_410, dir.path()).await;
+    let mut handles = spawn_three(dir.path()).await;
     let _leader = wait_for_leader(&handles, Duration::from_secs(5))
         .await
         .expect("leader");
