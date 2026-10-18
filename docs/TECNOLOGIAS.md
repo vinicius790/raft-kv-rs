@@ -53,7 +53,7 @@ O crate `src/client.rs` (`SessionClient`) não abre socket. Quem fala TCP é `tr
 - RocksDB ou SQLite
 - Métricas de throughput, Prometheus, ou benchmark com número publicado (os contadores 1.1 são só eventos deste processo)
 - Snapshot num único RPC sem `offset` (a 1.0 fatia; uma imagem pequena ainda cabe numa fatia)
-- Pre-vote desligado por padrão (está ligado, também no `TimeoutNow`)
+- Pre-vote desligado por padrão (está ligado; o `TimeoutNow` faz eleição direta)
 - Multi-raft, disco só de witness, faltas bizantinas
 
 ## Build

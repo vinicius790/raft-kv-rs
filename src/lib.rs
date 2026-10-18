@@ -4,6 +4,7 @@
 pub mod client;
 pub mod http;
 pub mod kv;
+pub mod linearizability;
 pub mod node;
 pub mod observe;
 pub mod pre_vote;
