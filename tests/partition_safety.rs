@@ -15,14 +15,20 @@ fn fast_timing() -> TimingConfig {
     }
 }
 
-async fn spawn_three(base: u16, root: &std::path::Path) -> Vec<NodeHandle> {
-    let addrs: Vec<(u64, SocketAddr)> = (0..3)
-        .map(|i| {
-            (
-                (i + 1) as u64,
-                format!("127.0.0.1:{}", base + i as u16).parse().unwrap(),
-            )
-        })
+/// Ask the OS for free loopback ports (bind 127.0.0.1:0), then release them
+/// so the nodes can bind. No fixed ports, so parallel runs do not collide.
+fn ephemeral_addrs(n: usize) -> Vec<SocketAddr> {
+    let listeners: Vec<std::net::TcpListener> = (0..n)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    listeners.iter().map(|l| l.local_addr().unwrap()).collect()
+}
+
+async fn spawn_three(root: &std::path::Path) -> Vec<NodeHandle> {
+    let addrs: Vec<(u64, SocketAddr)> = ephemeral_addrs(3)
+        .into_iter()
+        .enumerate()
+        .map(|(i, a)| ((i + 1) as u64, a))
         .collect();
     let mut handles = Vec::new();
     for (id, bind) in &addrs {
@@ -49,7 +55,7 @@ async fn spawn_three(base: u16, root: &std::path::Path) -> Vec<NodeHandle> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn minority_put_does_not_commit() {
     let dir = tempfile::tempdir().unwrap();
-    let mut handles = spawn_three(17_410, dir.path()).await;
+    let mut handles = spawn_three(dir.path()).await;
     let _leader = wait_for_leader(&handles, Duration::from_secs(5))
         .await
         .expect("leader");
