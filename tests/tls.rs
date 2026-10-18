@@ -178,3 +178,89 @@ async fn peer_identity_comes_from_certificate() {
     // Plain TCP peer to a TLS node: refused.
     assert!(probe(&ca, 2, Security::plain()).await < 1000);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn anonymous_tls_client_cannot_send_peer_rpcs() {
+    let ca = Ca::new();
+    let dir = tempfile::tempdir().unwrap();
+    let addrs: HashMap<u64, SocketAddr> = (1..=3).map(|i| (i, free_addr())).collect();
+    let mut nodes = Vec::new();
+    for id in 1..=3u64 {
+        let peers = addrs
+            .iter()
+            .filter(|(o, _)| **o != id)
+            .map(|(o, a)| (*o, *a))
+            .collect();
+        let cfg = NodeConfig {
+            id,
+            bind: addrs[&id],
+            peers,
+            data_dir: dir.path().join(format!("n{id}")),
+            timing: timing(),
+            learners: Vec::new(),
+            snapshot_threshold: 0,
+        };
+        nodes.push(
+            spawn_node_with(cfg, Security::tls(ca.material(id, &ca)))
+                .await
+                .unwrap(),
+        );
+    }
+    let leader = wait_for_leader(&nodes, Duration::from_secs(5))
+        .await
+        .expect("leader");
+    let term = nodes[0].status().await.term;
+
+    // No client certificate: only the client path is reachable.
+    let anon = Security::tls(TlsMaterial::client_only(ca.pem.as_bytes()).unwrap());
+    let attacks = [
+        Message::AppendEntries {
+            term: term + 100,
+            leader_id: 3,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: Vec::new(),
+            leader_commit: 0,
+        },
+        Message::RequestVote {
+            term: term + 200,
+            candidate_id: 2,
+            last_log_index: 1_000,
+            last_log_term: term + 200,
+        },
+        Message::TimeoutNow {
+            term: term + 300,
+            leader_id: leader,
+        },
+    ];
+    for target in addrs.values() {
+        for msg in &attacks {
+            let r = raft_mvp::transport::client_request_secure(
+                *target,
+                msg.clone(),
+                Duration::from_millis(300),
+                &anon,
+            )
+            .await;
+            assert!(r.is_err(), "anonymous peer RPC got a reply: {r:?}");
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    for n in &nodes {
+        let st = n.status().await;
+        assert!(
+            st.term < term + 100,
+            "node {} term moved to {} via anonymous RPC",
+            st.id,
+            st.term
+        );
+    }
+    assert_eq!(
+        wait_for_leader(&nodes, Duration::from_secs(2)).await,
+        Some(leader)
+    );
+
+    for n in nodes {
+        n.shutdown().await;
+    }
+}

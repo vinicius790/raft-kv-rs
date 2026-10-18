@@ -448,7 +448,17 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     }
 
     // Client path: first frame is a Message; we reply on the same socket.
+    // This path has no verified peer identity, so it may only carry client
+    // requests. Raft RPCs here would let anyone (e.g. a TLS client without a
+    // certificate) forge votes, entries or terms.
     let msg = rpc::decode(&buf).map_err(invalid)?;
+    if !is_client_request(&msg) {
+        warn!(%addr, "peer RPC on unauthenticated client connection; dropping");
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "peer RPC requires an authenticated peer connection",
+        ));
+    }
     let (reply_tx, mut reply_rx) = mpsc::channel::<Message>(1);
     tx.send(Inbound {
         from: None,
@@ -464,6 +474,29 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
         Err(_) => warn!(%addr, "client reply timeout"),
     }
     Ok(())
+}
+
+/// Default-deny classification: `true` only for messages an anonymous client
+/// may send. Exhaustive on purpose: a new `Message` variant must be classified
+/// here before the crate compiles.
+pub fn is_client_request(msg: &Message) -> bool {
+    match msg {
+        Message::Client(_)
+        | Message::StatusRequest
+        | Message::MetricsRequest
+        | Message::TraceRequest => true,
+        Message::RequestVote { .. }
+        | Message::RequestVoteResponse { .. }
+        | Message::PreVote { .. }
+        | Message::PreVoteResponse { .. }
+        | Message::AppendEntries { .. }
+        | Message::AppendEntriesResponse { .. }
+        | Message::InstallSnapshot { .. }
+        | Message::InstallSnapshotResponse { .. }
+        | Message::TimeoutNow { .. }
+        | Message::ClientReply(_)
+        | Message::StatusResponse(_) => false,
+    }
 }
 
 /// Client helper: send one request, wait for one reply.
@@ -500,6 +533,29 @@ pub async fn client_request_secure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn client_path_rejects_peer_rpcs() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let allow: Authorize = Box::new(|_| true);
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        Frame::write(
+            &mut a,
+            &Message::TimeoutNow {
+                term: 9,
+                leader_id: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let e = handle_connection(&mut b, addr, tx, &allow)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(rx.try_recv().is_err(), "nothing may reach the core");
+        assert!(is_client_request(&Message::StatusRequest));
+    }
 
     #[tokio::test]
     async fn frame_roundtrip_over_duplex() {
