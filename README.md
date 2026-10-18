@@ -1,4 +1,4 @@
-# raft-mvp
+# raft-kv-rs
 
 Implementação didática do protocolo [Raft](https://raft.github.io/raft.pdf) (Ongaro e Ousterhout) em Rust. Um processo é um servidor. O cliente fala TCP. O log é a fonte da verdade do KV.
 
@@ -24,7 +24,7 @@ Raft separa três problemas que um líder único resolve em ordem.
 2. **O que ficou decidido.** Uma entrada commitada está em uma maioria da configuração vigente e, no líder, pertence ao termo atual (a regra que impede o líder de commit de entrada antiga). O KV só aplica até `commitIndex`. Um `Put` comum não é idempotente. Um `SessionPut` é: o par `(client_id, serial)` entra no log no máximo uma vez, e o retry do mesmo serial não troca o valor.
 3. **Quem faz parte.** Trocar o conjunto de votantes num passo só abre uma janela em que duas maiorias disjuntas elegem dois líderes. A mudança passa por **C_old,new** (consenso conjunto: maioria do conjunto velho *e* maioria do conjunto novo) e só depois o líder anexa **C_new**. Learner recebe log e não vota até ser promovido.
 
-Leitura linearizável não usa lease de relógio. `Get` faz read index: o líder só responde depois de um quorum de heartbeat no termo em que é líder. `RawGet` lê a memória local e **não** é linearizável. Está na CLI só para contrastar.
+Leitura linearizável não usa lease de relógio. `Get` faz read index: o líder só responde depois de commitar o noop do seu termo e de um quorum responder à rodada de heartbeat aberta por essa leitura. `RawGet` lê a memória local e **não** é linearizável. Está na CLI só para contrastar.
 
 Check-quorum, no processo TCP, tira o líder que perdeu contato com a maioria **sem** subir o termo. O simulador determinístico não arma esse timer.
 
