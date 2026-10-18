@@ -34,3 +34,22 @@ jobs:
 
       - name: Test
         run: cargo test --locked --all-targets
+
+  tls:
+    name: clippy + test (--features tls)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Clippy (tls)
+        run: cargo clippy --locked --all-targets --features tls -- -D warnings
+
+      - name: Test (tls)
+        run: cargo test --locked --all-targets --features tls
