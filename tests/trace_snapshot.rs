@@ -209,3 +209,58 @@ async fn partitioned_node_lags_then_matches_commit_after_heal() {
     assert_eq!(sim.commit_of(2), sim.commit_of(3));
     assert!(!sim.leaders_by_term.is_empty());
 }
+
+/// Leader-side snapshot chunk for `peer`, forced by rewinding next_index.
+async fn capture_snapshot(leader: &mut RaftCore, peer: u64) -> Message {
+    leader.compact_log(leader.commit_index()).await.unwrap();
+    let next = leader.persistent.log.last_index() + 1;
+    if let Some(ls) = leader.leader.as_mut() {
+        ls.next_index.insert(peer, 1);
+        ls.snap_offset.insert(peer, 0);
+        ls.snap_busy.remove(&peer);
+    }
+    let out = leader.on_heartbeat_timeout().await.unwrap();
+    let snap = sends(&out)
+        .into_iter()
+        .find(|(_, m)| matches!(m, Message::InstallSnapshot { done: true, .. }))
+        .expect("single-chunk snapshot")
+        .1;
+    if let Some(ls) = leader.leader.as_mut() {
+        ls.next_index.insert(peer, next);
+        ls.snap_offset.remove(&peer);
+        ls.snap_busy.remove(&peer);
+        ls.inflight.remove(&peer);
+        ls.inflight_bytes.insert(peer, 0);
+    }
+    snap
+}
+
+/// Regression: a delayed snapshot older than the follower's commit index must
+/// not roll the KV back (etcd ignores it in `restore`).
+#[tokio::test]
+async fn stale_snapshot_does_not_roll_back_kv() {
+    let (mut leader, mut follower) = elect_pair().await;
+    replicate_put(&mut leader, &mut follower, "k", "v1").await;
+    let old_snap = capture_snapshot(&mut leader, 2).await;
+    replicate_put(&mut leader, &mut follower, "k", "v2").await;
+    assert_eq!(follower.kv.get("k").map(String::as_str), Some("v2"));
+    let commit = follower.commit_index();
+    let last = follower.persistent.log.last_index();
+    let out = follower.handle_message(Some(1), old_snap, 0).await.unwrap();
+    assert_eq!(
+        follower.kv.get("k").map(String::as_str),
+        Some("v2"),
+        "stale snapshot rolled the KV back"
+    );
+    assert_eq!(follower.commit_index(), commit);
+    assert_eq!(follower.volatile.last_applied, commit);
+    assert_eq!(follower.persistent.log.last_index(), last);
+    assert!(sends(&out).iter().any(|(_, m)| matches!(
+        m,
+        Message::InstallSnapshotResponse {
+            success: true,
+            done: true,
+            ..
+        }
+    )));
+}
