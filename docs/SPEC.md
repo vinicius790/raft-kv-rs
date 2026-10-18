@@ -57,7 +57,7 @@ O frame TCP continua com teto de 16 MiB. Uma fatia não deve passar desse teto.
 
 ## Read index
 
-`ClientRequest::Get` e `ClientRequest::ReadIndex` são o mesmo caminho: o líder zera os acks de heartbeat, conta a si mesmo e só responde quando `has_config_quorum` no **termo atual**. Sem essa maioria (líder particionado) a resposta fica pendente. `NodeHandle::get` e o subcomando `get` da CLI usam esse caminho.
+`ClientRequest::Get` e `ClientRequest::ReadIndex` são o mesmo caminho (tese do Raft, §6.4): o líder abre uma rodada nova (`read_round`), zera os acks, conta a si mesmo e manda `AppendEntries` com `read_ctx = read_round`. Só responde quando (1) o noop do termo atual já está commitado e (2) `has_config_quorum` sobre os peers que responderam **essa** rodada (o follower ecoa `read_ctx`). Ack de rodada anterior não conta. Sem essas duas condições (líder novo ou particionado) a resposta fica pendente. `NodeHandle::get` e o subcomando `get` da CLI usam esse caminho.
 
 `ClientRequest::RawGet` (e `NodeHandle::raw_get`) lê o estado já aplicado no líder **sem** read index. Não é linearizável.
 

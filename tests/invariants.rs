@@ -314,6 +314,7 @@ async fn lagged_follower_refuses_prefix_and_recovers_only_by_install_snapshot() 
                     match_index: idx,
                     conflict_index: 0,
                     need_snapshot: false,
+                    read_ctx: 0,
                 },
                 0,
             )
@@ -343,6 +344,7 @@ async fn lagged_follower_refuses_prefix_and_recovers_only_by_install_snapshot() 
                     },
                 }],
                 leader_commit: snap_idx,
+                read_ctx: 0,
             },
             0,
         )

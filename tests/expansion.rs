@@ -241,6 +241,7 @@ async fn snapshot_send_adds_chunk_bytes() {
                 match_index: last,
                 conflict_index: 0,
                 need_snapshot: false,
+                read_ctx: 0,
             },
             0,
         )
