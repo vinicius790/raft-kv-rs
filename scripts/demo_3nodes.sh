@@ -6,7 +6,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 BIN="${BIN:-target/debug/raft-node}"
-DATA="${DATA_DIR:-/tmp/raft-mvp-demo-$$}"
+DATA="${DATA_DIR:-/tmp/raft-kv-rs-demo-$$}"
 P1=7101; P2=7102; P3=7103
 LOGDIR="$DATA/logs"
 mkdir -p "$DATA"/{n1,n2,n3} "$LOGDIR"
