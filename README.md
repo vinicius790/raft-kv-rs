@@ -159,7 +159,7 @@ curl http://127.0.0.1:8001/kv/k
 
 Métricas (`metrics` 0.24 + `metrics-exporter-prometheus`, label `node`): `raft_term`, `raft_commit_index`, `raft_applied_index`, `raft_role` (0 follower, 1 candidate, 2 leader), `raft_elections_total`, `raft_snapshot_bytes_total`, `raft_append_latency_seconds` (histograma AppendEntries→resposta, label `peer`), `kv_requests_total{op,result}`.
 
-Tracing: cada RPC recebido roda num span `rpc{node,kind,peer,term}` (nível debug). `RUST_LOG=raft_mvp=debug` mostra.
+Tracing: cada RPC recebido roda num span `rpc{node,kind,peer,term}` (nível debug). `RUST_LOG=raft_kv_rs=debug` mostra.
 
 ## Testes
 

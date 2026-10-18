@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use raft_mvp::node::{spawn_node, NodeConfig, NodeHandle};
-use raft_mvp::raft::TimingConfig;
+use raft_kv_rs::node::{spawn_node, NodeConfig, NodeHandle};
+use raft_kv_rs::raft::TimingConfig;
 use tokio::net::TcpListener;
 
 struct Cluster {
@@ -53,7 +53,7 @@ async fn cluster() -> Cluster {
         .unwrap();
         let client = h.client();
         let hp = http.clone();
-        tokio::spawn(async move { raft_mvp::http::serve(listener, client, hp).await });
+        tokio::spawn(async move { raft_kv_rs::http::serve(listener, client, hp).await });
         nodes.push(h);
     }
     Cluster {

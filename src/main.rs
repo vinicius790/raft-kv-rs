@@ -163,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!(id, http = %listener.local_addr()?, "http api");
                 let client = handle.client();
                 tokio::spawn(async move {
-                    if let Err(e) = raft_mvp::http::serve(listener, client, http_peers).await {
+                    if let Err(e) = raft_kv_rs::http::serve(listener, client, http_peers).await {
                         tracing::error!(error = %e, "http server stopped");
                     }
                 });
