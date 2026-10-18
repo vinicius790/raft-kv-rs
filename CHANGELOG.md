@@ -8,6 +8,7 @@ O formato segue o espírito de Keep a Changelog: versão, data, o que entrou e o
 
 - Crate renomeado de `raft-mvp` para `raft-kv-rs`, igual ao repositório. O binário continua `raft-node`. Quem importa a biblioteca troca `raft_mvp::` por `raft_kv_rs::`; o filtro de log padrão da CLI passa a ser `raft_kv_rs=info`.
 - `Cargo.toml`: `repository`/`homepage` apontam para https://github.com/vinicius790/raft-kv-rs e o e-mail placeholder saiu de `authors`.
+- Removidos `raft::election::majority` e `pre_vote::pre_vote_majority`, que não tinham uso em `src/` nem `tests/`. A conta de quorum fica só em `quorum::majority` / `quorum::has_config_quorum`.
 - Formato em disco (`raft-state.bin`, versão 1) e protocolo de rede não mudaram.
 
 ## 1000000.0.0 — 2026-10-03
