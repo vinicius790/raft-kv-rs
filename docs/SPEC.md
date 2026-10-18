@@ -53,6 +53,8 @@ Papel `Learner`: recebe AppendEntries e InstallSnapshot, não vota, não inicia 
 
 `compact_log` aplica até `commitIndex`, grava KV + sessões + config, e apaga o prefixo do log. Se `nextIndex` do peer cai em ou antes do snapshot, o líder manda `InstallSnapshot` **em fatias**: `offset` é o byte inicial do pedaço, `done` marca o último. O follower junta os bytes e **só trunca o log quando `done` e o CRC-32 do buffer é o `checksum` anunciado** (CRC-32/ISO-HDLC da imagem inteira, o mesmo em cada fatia). Checksum divergente recusa sem truncar. Um pedaço cujo `offset` não continua o buffer (um buraco) é recusado; o log local permanece. `snapshot_chunk_size` (padrão 1 MiB) define o tamanho de cada fatia. Uma imagem que cabe numa fatia sai com `offset = 0` e `done = true`, como um único RPC.
 
+Ao instalar, o follower só mantém as entradas depois de `last_included_index` se a entrada nesse índice tiver o mesmo termo `last_included_term` (Raft, Fig. 13); senão descarta o log inteiro.
+
 Snapshot com `last_included_index <= commitIndex` do follower é velho: o follower responde `success`/`done` (o líder avança `matchIndex`) e **não** troca KV, log nem config, para o KV não voltar no tempo.
 
 O frame TCP continua com teto de 16 MiB. Uma fatia não deve passar desse teto.
