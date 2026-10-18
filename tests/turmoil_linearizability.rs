@@ -9,10 +9,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use raft_mvp::linearizability::{self, Op, OpKind};
-use raft_mvp::raft::{Outbound, RaftCore, TimingConfig};
-use raft_mvp::rpc::{self, ClientRequest, ClientResponse, Message, NodeId};
-use raft_mvp::storage::Storage;
+use raft_kv_rs::linearizability::{self, Op, OpKind};
+use raft_kv_rs::raft::{Outbound, RaftCore, TimingConfig};
+use raft_kv_rs::rpc::{self, ClientRequest, ClientResponse, Message, NodeId};
+use raft_kv_rs::storage::Storage;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
