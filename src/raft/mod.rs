@@ -28,6 +28,10 @@ use replication::{advance_commit_index, log_matches};
 
 /// Max entries per AppendEntries (batching / pipeline).
 pub const MAX_APPEND_BATCH: usize = 64;
+/// Default cap on client Puts proposed together.
+pub const DEFAULT_CLIENT_BATCH: usize = 64;
+/// Default byte cap (key + value) of one client Put batch.
+pub const DEFAULT_CLIENT_BATCH_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct TimingConfig {
@@ -98,6 +102,11 @@ pub struct RaftCore {
     pub heard_from_leader: bool,
     /// How many AppendEntries batches may be outstanding to one peer.
     pub pipeline_window: usize,
+    /// Max client Puts the node loop folds into one proposal (one persist,
+    /// one replication round).
+    pub max_client_batch: usize,
+    /// Byte cap (key + value) for one client Put batch.
+    pub max_client_batch_bytes: usize,
     /// Pause replication to a peer once unacked AppendEntries bytes reach this.
     pub max_inflight_bytes: u64,
     /// InstallSnapshot chunk size in bytes. The follower installs only on `done`.
@@ -220,6 +229,8 @@ impl RaftCore {
             peer_addrs: HashMap::new(),
             heard_from_leader: false,
             pipeline_window: 8,
+            max_client_batch: DEFAULT_CLIENT_BATCH,
+            max_client_batch_bytes: DEFAULT_CLIENT_BATCH_BYTES,
             max_inflight_bytes: 1 << 20,
             snapshot_chunk_size: 1 << 20,
             snap_cache: None,
@@ -537,11 +548,27 @@ impl RaftCore {
         Ok(out)
     }
 
+    /// Go-back-N round: re-plan every peer from `next_index`, replacing its
+    /// in-flight window. Used on heartbeat ticks, leadership start and read
+    /// index rounds; it is what recovers lost AppendEntries.
     fn broadcast_append_entries(&mut self) -> Vec<Outbound> {
         let peers = self.peer_ids();
         let mut out = Vec::new();
         for peer in peers {
-            out.extend(self.replicate_peer(peer, true));
+            out.extend(self.replicate_peer_mode(peer, true, true));
+        }
+        out
+    }
+
+    /// Pipelined round: send only entries past what is already in flight to
+    /// each peer (bounded by `pipeline_window` / `max_inflight_bytes`). With
+    /// `allow_empty`, a peer with nothing new still gets an empty AppendEntries
+    /// carrying the current `leader_commit`.
+    fn broadcast_new_entries(&mut self, allow_empty: bool) -> Vec<Outbound> {
+        let peers = self.peer_ids();
+        let mut out = Vec::new();
+        for peer in peers {
+            out.extend(self.replicate_peer_mode(peer, allow_empty, false));
         }
         out
     }
@@ -549,6 +576,17 @@ impl RaftCore {
     /// Send the next pipelined AppendEntries batches, or the next snapshot chunk.
     /// `match_index` is not touched here — only an ack moves it.
     fn replicate_peer(&mut self, peer: NodeId, allow_empty_heartbeat: bool) -> Vec<Outbound> {
+        self.replicate_peer_mode(peer, allow_empty_heartbeat, false)
+    }
+
+    /// `fresh = true`: restart the window at `next_index` (retransmit).
+    /// `fresh = false`: keep the in-flight window and append after it.
+    fn replicate_peer_mode(
+        &mut self,
+        peer: NodeId,
+        allow_empty_heartbeat: bool,
+        fresh: bool,
+    ) -> Vec<Outbound> {
         if self.volatile.role != Role::Leader || self.leader.is_none() {
             return vec![];
         }
@@ -567,22 +605,30 @@ impl RaftCore {
 
         let cap = self.max_inflight_bytes.max(1);
         let window = self.pipeline_window.max(1);
-        let (already_bytes, already_n) = {
+        let (already_bytes, already_n, inflight_end) = {
             let leader = self.leader.as_ref().unwrap();
+            let q = leader.inflight.get(&peer);
             (
                 leader.inflight_bytes.get(&peer).copied().unwrap_or(0),
-                leader.inflight.get(&peer).map(|v| v.len()).unwrap_or(0),
+                q.map(|v| v.len()).unwrap_or(0),
+                q.and_then(|v| v.iter().map(|m| m.last_index).max()),
             )
         };
-        if already_n > 0 && already_bytes >= cap {
+        if !fresh && already_n > 0 && (already_bytes >= cap || already_n >= window) {
+            return self.flow_paused_heartbeat(peer, allow_empty_heartbeat);
+        }
+        if fresh && already_n > 0 && already_bytes >= cap {
             return self.flow_paused_heartbeat(peer, allow_empty_heartbeat);
         }
 
-        let mut cursor = next;
+        // Incremental mode continues after the last in-flight batch.
+        let (mut cursor, kept_n, mut bytes_acc) = match (fresh, inflight_end) {
+            (false, Some(end)) if end >= next => (end + 1, already_n, already_bytes),
+            _ => (next, 0, 0),
+        };
         let last = self.persistent.log.last_index();
         let mut planned: Vec<(LogIndex, u64)> = Vec::new();
-        let mut bytes_acc = 0u64;
-        while planned.len() < window && cursor <= last {
+        while kept_n + planned.len() < window && cursor <= last {
             let entries = self
                 .persistent
                 .log
@@ -591,7 +637,7 @@ impl RaftCore {
                 break;
             }
             let msg_bytes = bincode::serialized_size(&entries).unwrap_or(0);
-            if !planned.is_empty() && bytes_acc.saturating_add(msg_bytes) > cap {
+            if (kept_n > 0 || !planned.is_empty()) && bytes_acc.saturating_add(msg_bytes) > cap {
                 break;
             }
             let n = entries.len() as LogIndex;
@@ -626,7 +672,11 @@ impl RaftCore {
             out.push(Outbound::Send { to: peer, msg });
         }
         if let Some(leader) = self.leader.as_mut() {
-            leader.inflight.insert(peer, inflight);
+            if kept_n > 0 {
+                leader.inflight.entry(peer).or_default().extend(inflight);
+            } else {
+                leader.inflight.insert(peer, inflight);
+            }
             leader.inflight_bytes.insert(peer, bytes_acc);
         }
         if out.is_empty() {
@@ -1729,6 +1779,44 @@ impl RaftCore {
         true
     }
 
+    /// Propose several plain Puts at once: one append run, one persist, one
+    /// pipelined replication round. Each Put is still acknowledged only when
+    /// its own index commits (commit rules unchanged).
+    pub async fn handle_put_batch(
+        &mut self,
+        puts: Vec<(u64, String, String)>,
+    ) -> anyhow::Result<Vec<Outbound>> {
+        if self.volatile.role != Role::Leader {
+            return Ok(puts
+                .into_iter()
+                .map(|(corr, _, _)| Outbound::ClientReply {
+                    corr,
+                    resp: ClientResponse::not_leader(self.volatile.leader_id),
+                })
+                .collect());
+        }
+        let mut out = Vec::with_capacity(puts.len() + 4);
+        let mut waits = Vec::with_capacity(puts.len());
+        for (corr, key, value) in puts {
+            self.persistent.log.append(LogEntry {
+                term: self.persistent.current_term,
+                command: Command::Put { key, value },
+            });
+            waits.push(Outbound::ClientWaitCommit {
+                corr,
+                wait_index: self.persistent.log.last_index(),
+            });
+        }
+        // Durable before any follower sees the entries.
+        self.persist().await?;
+        out.extend(self.broadcast_new_entries(false));
+        out.extend(self.try_commit());
+        self.persist().await?;
+        out.extend(waits);
+        out.push(Outbound::ResetHeartbeatTimer);
+        Ok(out)
+    }
+
     async fn handle_client(
         &mut self,
         req: ClientRequest,
@@ -2091,9 +2179,11 @@ impl RaftCore {
             self.apply_committed();
             if self.try_leave_joint() {
                 // Broadcast the C_new entry.
-                out.extend(self.broadcast_append_entries());
+                out.extend(self.broadcast_new_entries(false));
             }
-            out.extend(self.broadcast_append_entries());
+            // Followers learn the new commit index; entries already in flight
+            // are not resent.
+            out.extend(self.broadcast_new_entries(true));
         }
         out
     }
