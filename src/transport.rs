@@ -172,6 +172,8 @@ pub struct PeerPool {
     from: NodeId,
     addrs: PeerMap,
     cfg: PoolConfig,
+    /// Last term in which this node became leader (see [`Self::on_leader_term`]).
+    leader_term: Arc<std::sync::atomic::AtomicU64>,
     conns: Arc<Mutex<HashMap<NodeId, Arc<Mutex<PeerConn>>>>>,
 }
 
@@ -181,6 +183,7 @@ impl PeerPool {
             from,
             addrs,
             cfg,
+            leader_term: Arc::default(),
             conns: Arc::default(),
         }
     }
@@ -255,6 +258,36 @@ impl PeerPool {
                 self.fail(&mut conn);
                 Err(e)
             }
+        }
+    }
+
+    /// We just heard from `id` (inbound peer message): it is up, so drop any
+    /// dial backoff. Without this a peer that started after us could stay
+    /// unreachable for a backoff window right after an election, delaying the
+    /// new leader's first AppendEntries.
+    pub async fn mark_alive(&self, id: NodeId) {
+        let slot = self.conns.lock().await.get(&id).cloned();
+        if let Some(slot) = slot {
+            let mut c = slot.lock().await;
+            if c.stream.is_none() {
+                c.failures = 0;
+                c.retry_at = None;
+            }
+        }
+    }
+
+    /// Called while leader. On the first call for a new term, clear every dial
+    /// backoff so the leader's first AppendEntries goes out immediately.
+    pub async fn on_leader_term(&self, term: u64) {
+        use std::sync::atomic::Ordering;
+        if self.leader_term.swap(term, Ordering::AcqRel) == term {
+            return;
+        }
+        let slots: Vec<_> = self.conns.lock().await.values().cloned().collect();
+        for slot in slots {
+            let mut c = slot.lock().await;
+            c.failures = 0;
+            c.retry_at = None;
         }
     }
 
