@@ -4,11 +4,11 @@
 
 use std::collections::BTreeMap;
 
-use raft_mvp::raft::{ClusterConfig, Membership, Outbound, RaftCore, Role, TimingConfig};
-use raft_mvp::rpc::{ClientRequest, Message};
-use raft_mvp::sim::Sim;
-use raft_mvp::storage::Storage;
-use raft_mvp::{Command, SessionClient};
+use raft_kv_rs::raft::{ClusterConfig, Membership, Outbound, RaftCore, Role, TimingConfig};
+use raft_kv_rs::rpc::{ClientRequest, Message};
+use raft_kv_rs::sim::Sim;
+use raft_kv_rs::storage::Storage;
+use raft_kv_rs::{Command, SessionClient};
 
 fn timing() -> TimingConfig {
     TimingConfig {
@@ -314,6 +314,7 @@ async fn lagged_follower_refuses_prefix_and_recovers_only_by_install_snapshot() 
                     match_index: idx,
                     conflict_index: 0,
                     need_snapshot: false,
+                    read_ctx: 0,
                 },
                 0,
             )
@@ -335,7 +336,7 @@ async fn lagged_follower_refuses_prefix_and_recovers_only_by_install_snapshot() 
                 leader_id: 1,
                 prev_log_index: snap_idx.saturating_sub(1),
                 prev_log_term: 1,
-                entries: vec![raft_mvp::LogEntry {
+                entries: vec![raft_kv_rs::LogEntry {
                     term: leader.persistent.current_term,
                     command: Command::Put {
                         key: "a".into(),
@@ -343,6 +344,7 @@ async fn lagged_follower_refuses_prefix_and_recovers_only_by_install_snapshot() 
                     },
                 }],
                 leader_commit: snap_idx,
+                read_ctx: 0,
             },
             0,
         )
