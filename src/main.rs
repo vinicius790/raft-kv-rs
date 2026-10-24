@@ -88,6 +88,12 @@ enum Commands {
         /// Compact after this many committed entries past the snapshot. 0 disables.
         #[arg(long, default_value_t = 0)]
         snapshot_threshold: u64,
+        /// Serve the HTTP API (GET/PUT/DELETE /kv/{key}, /status, /health) here.
+        #[arg(long)]
+        admin_addr: Option<SocketAddr>,
+        /// HTTP addresses of the other nodes (id=addr,...), used for 307 redirects.
+        #[arg(long, default_value = "")]
+        http_peers: String,
     },
     /// Put a key via a node address (follows leader hint once).
     Put {
@@ -173,7 +179,10 @@ async fn main() -> anyhow::Result<()> {
             election_max_ms,
             learners,
             snapshot_threshold,
+            admin_addr,
+            http_peers,
         } => {
+            let http_peers = parse_peers(&http_peers)?;
             let mut peers = parse_peers(&peers)?;
             let learner_map = parse_peers(&learners)?;
             let learner_ids: Vec<NodeId> = learner_map.keys().copied().collect();
@@ -193,6 +202,16 @@ async fn main() -> anyhow::Result<()> {
             };
             let handle = spawn_node_with(cfg, sec).await?;
             tracing::info!(id, addr = %handle.addr, "serving");
+            if let Some(hb) = admin_addr {
+                let listener = tokio::net::TcpListener::bind(hb).await?;
+                tracing::info!(id, http = %listener.local_addr()?, "http api");
+                let client = handle.client();
+                tokio::spawn(async move {
+                    if let Err(e) = raft_kv_rs::http::serve(listener, client, http_peers).await {
+                        tracing::error!(error = %e, "http server stopped");
+                    }
+                });
+            }
             tokio::signal::ctrl_c().await?;
             handle.shutdown().await;
         }

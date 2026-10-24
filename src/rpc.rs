@@ -139,6 +139,10 @@ pub enum ClientRequest {
     PromoteLearner {
         id: NodeId,
     },
+    /// Delete a key (appended last: existing wire tags unchanged).
+    Delete {
+        key: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

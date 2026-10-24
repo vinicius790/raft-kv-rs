@@ -137,6 +137,30 @@ cargo run --bin raft-node -- transfer --addr 127.0.0.1:7001 --target 2
 
 O script `scripts/demo_3nodes.sh` sobe três processos em `127.0.0.1`. É TCP de verdade neste host. Não simula datacenter nem rede parcial.
 
+## API HTTP, métricas e tracing
+
+`raft-node serve --admin-addr 127.0.0.1:8001 --http-peers 2=127.0.0.1:8002,3=127.0.0.1:8003 ...` sobe um servidor [axum](https://docs.rs/axum) 0.8:
+
+| Método | Rota | Resposta |
+|---|---|---|
+| `GET` | `/kv/{key}` | `200` + valor (read index, linearizável), `404` se ausente |
+| `PUT` | `/kv/{key}` | corpo = valor; `204` depois do commit |
+| `DELETE` | `/kv/{key}` | `204` depois do commit |
+| `GET` | `/status` | JSON: id, role, term, leader, commit, applied, config |
+| `GET` | `/health` | `200 ok` se o loop do nó responde |
+| `GET` | `/metrics` | texto Prometheus |
+
+Um follower responde `307` com `Location` do líder (se `--http-peers` o conhece), senão `503` com `leader_hint`. Timeout de consenso: `504`.
+
+```sh
+curl -L -X PUT --data v http://127.0.0.1:8002/kv/k   # segue o 307 até o líder
+curl http://127.0.0.1:8001/kv/k
+```
+
+Métricas (`metrics` 0.24 + `metrics-exporter-prometheus`, label `node`): `raft_term`, `raft_commit_index`, `raft_applied_index`, `raft_role` (0 follower, 1 candidate, 2 leader), `raft_elections_total`, `raft_snapshot_bytes_total`, `raft_append_latency_seconds` (histograma AppendEntries→resposta, label `peer`), `kv_requests_total{op,result}`.
+
+Tracing: cada RPC recebido roda num span `rpc{node,kind,peer,term}` (nível debug). `RUST_LOG=raft_kv_rs=debug` mostra.
+
 ## Testes
 
 `cargo test` é a suíte. Os nomes em `tests/invariants.rs` continuam sendo o contrato da 1.1.1. A 1000000.0.0 acrescenta `tests/trace_snapshot.rs`:

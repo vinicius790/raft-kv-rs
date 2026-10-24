@@ -2,6 +2,7 @@
 //! joint membership, chunked snapshots, pre-vote, read index, leadership transfer.
 
 pub mod client;
+pub mod http;
 pub mod kv;
 pub mod linearizability;
 pub mod node;
@@ -12,6 +13,7 @@ pub mod raft;
 pub mod rpc;
 pub mod sim;
 pub mod storage;
+pub mod telemetry;
 #[cfg(feature = "tls")]
 pub mod tls;
 pub mod transport;
