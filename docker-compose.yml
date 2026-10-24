@@ -4,7 +4,7 @@ x-node: &node
   image: raft-kv-rs:local
   restart: unless-stopped
   environment:
-    RUST_LOG: raft_mvp=info
+    RUST_LOG: raft_kv_rs=info
 
 services:
   n1:
