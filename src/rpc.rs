@@ -216,9 +216,37 @@ pub fn encode(msg: &Message) -> Result<Vec<u8>, bincode::Error> {
     Ok(out)
 }
 
+/// Largest accepted frame payload (bytes). Readers reject larger length prefixes.
+pub const MAX_FRAME: usize = 16 * 1024 * 1024;
+
 /// Decode payload bytes (without the length prefix).
+///
+/// Same wire format as `bincode::deserialize` (fixint, trailing bytes allowed)
+/// but with a byte limit, so a hostile length field inside the payload cannot
+/// make the decoder allocate more than [`MAX_FRAME`].
 pub fn decode(payload: &[u8]) -> Result<Message, bincode::Error> {
-    bincode::deserialize(payload)
+    use bincode::Options;
+    bincode::options()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(MAX_FRAME as u64)
+        .deserialize(payload)
+}
+
+/// Decode a full `[u32 BE length][payload]` frame from a buffer.
+/// Rejects short buffers, oversize lengths and trailing garbage. Never panics.
+pub fn decode_frame(buf: &[u8]) -> Result<Message, String> {
+    let Some((len, rest)) = buf.split_first_chunk::<4>() else {
+        return Err("short frame header".into());
+    };
+    let len = u32::from_be_bytes(*len) as usize;
+    if len > MAX_FRAME {
+        return Err("frame too large".into());
+    }
+    if rest.len() != len {
+        return Err(format!("length {len} != payload {}", rest.len()));
+    }
+    decode(rest).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

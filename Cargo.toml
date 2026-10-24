@@ -31,6 +31,7 @@ rustls-webpki = { version = "0.103", default-features = false, features = ["ring
 rustls-pki-types = { version = "1", features = ["std"], optional = true }
 
 [dev-dependencies]
+proptest = "1"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs", "test-util"] }

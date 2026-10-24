@@ -327,6 +327,11 @@ impl RaftCore {
         self.volatile.role == Role::Leader
     }
 
+    /// Durable state handle (simulator restarts reopen a core from it).
+    pub(crate) fn storage(&self) -> &Storage {
+        &self.storage
+    }
+
     pub fn commit_index(&self) -> LogIndex {
         self.volatile.commit_index
     }
