@@ -1753,3 +1753,75 @@ async fn deposed_leader_answers_pending_read_instead_of_hanging() {
         assert!(answered, "check-quorum step-down left the read unanswered");
     }
 }
+
+/// Thesis §3.10: a transfer to a lagging target keeps replicating and sends
+/// `TimeoutNow` once the target acks the leader's last index, instead of
+/// failing at once with "target not caught up".
+#[tokio::test]
+async fn transfer_waits_for_lagging_target_then_sends_timeout_now() {
+    let (_d, mut leader) = elect_leader(vec![2, 3]).await;
+    leader
+        .handle_message(
+            None,
+            Message::Client(ClientRequest::Put {
+                key: "k".into(),
+                value: "v".into(),
+            }),
+            1,
+        )
+        .await
+        .unwrap();
+    let last = leader.persistent.log.last_index();
+    let term = leader.persistent.current_term;
+    let out = leader
+        .handle_message(
+            None,
+            Message::Client(ClientRequest::TransferLeadership { target: 2 }),
+            9,
+        )
+        .await
+        .unwrap();
+    assert_eq!(leader.volatile.role, Role::Leader);
+    assert!(
+        !out.iter()
+            .any(|o| matches!(o, Outbound::ClientReply { corr: 9, .. })),
+        "transfer must wait for the target, not fail: {out:?}"
+    );
+    assert!(
+        out.iter().any(|o| matches!(
+            o,
+            Outbound::Send {
+                to: 2,
+                msg: Message::AppendEntries { .. }
+            }
+        )),
+        "leader must keep replicating to the target"
+    );
+    let out = leader
+        .handle_message(
+            Some(2),
+            Message::AppendEntriesResponse {
+                term,
+                success: true,
+                match_index: last,
+                conflict_index: 0,
+                need_snapshot: false,
+                read_ctx: 0,
+            },
+            0,
+        )
+        .await
+        .unwrap();
+    assert!(out.iter().any(|o| matches!(
+        o,
+        Outbound::Send {
+            to: 2,
+            msg: Message::TimeoutNow { .. }
+        }
+    )));
+    assert!(out
+        .iter()
+        .any(|o| matches!(o, Outbound::ClientReply { corr: 9, resp } if resp.ok)));
+    assert_eq!(leader.volatile.role, Role::Follower);
+    assert!(leader.pending_transfer.is_none());
+}

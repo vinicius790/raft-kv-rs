@@ -76,6 +76,17 @@ pub enum Outbound {
     ResetHeartbeatTimer,
 }
 
+/// A `TransferLeadership` the leader is still working on: it keeps
+/// replicating to `target` and sends `TimeoutNow` once `target` holds the
+/// whole log, or gives up after `ticks_left` heartbeat ticks.
+#[derive(Debug, Clone)]
+pub struct PendingTransfer {
+    pub target: NodeId,
+    pub corr: u64,
+    pub term: Term,
+    pub ticks_left: u32,
+}
+
 pub struct RaftCore {
     pub id: NodeId,
     pub persistent: PersistentState,
@@ -90,6 +101,8 @@ pub struct RaftCore {
     pub pre_vote: Option<PreVoteState>,
     /// Pending read-index requests awaiting quorum heartbeat.
     pub pending_reads: Vec<(u64, String, Term)>,
+    /// Leadership transfer waiting for the target to catch up (thesis §3.10).
+    pub pending_transfer: Option<PendingTransfer>,
     /// Disable pre-vote (tests that assert classic disruption can set false).
     pub enable_pre_vote: bool,
     /// Max AppendEntries batch size.
@@ -224,6 +237,7 @@ impl RaftCore {
             snapshot_term: snap_term,
             pre_vote: None,
             pending_reads: Vec::new(),
+            pending_transfer: None,
             enable_pre_vote: true,
             max_batch: MAX_APPEND_BATCH,
             peer_addrs: HashMap::new(),
@@ -311,6 +325,11 @@ impl RaftCore {
 
     pub fn is_leader(&self) -> bool {
         self.volatile.role == Role::Leader
+    }
+
+    /// Durable state handle (simulator restarts reopen a core from it).
+    pub(crate) fn storage(&self) -> &Storage {
+        &self.storage
     }
 
     pub fn commit_index(&self) -> LogIndex {
@@ -544,6 +563,18 @@ impl RaftCore {
             return Ok(vec![]);
         }
         let mut out = self.broadcast_append_entries();
+        if let Some(t) = self.pending_transfer.as_mut() {
+            if t.ticks_left == 0 {
+                let corr = t.corr;
+                self.pending_transfer = None;
+                out.push(Outbound::ClientReply {
+                    corr,
+                    resp: ClientResponse::err("target not caught up"),
+                });
+            } else {
+                t.ticks_left -= 1;
+            }
+        }
         out.push(Outbound::ResetHeartbeatTimer);
         Ok(out)
     }
@@ -852,8 +883,19 @@ impl RaftCore {
     /// leader, no ack will ever confirm it: answer `not leader` now instead of
     /// leaving the client waiting forever.
     fn abort_reads_if_deposed(&mut self) -> Vec<Outbound> {
+        let mut out = Vec::new();
+        if let Some(t) = self.pending_transfer.as_ref() {
+            if self.volatile.role != Role::Leader || t.term != self.persistent.current_term {
+                let hint = self.volatile.leader_id.filter(|&l| l != self.id);
+                out.push(Outbound::ClientReply {
+                    corr: t.corr,
+                    resp: ClientResponse::not_leader(hint),
+                });
+                self.pending_transfer = None;
+            }
+        }
         if self.pending_reads.is_empty() {
-            return vec![];
+            return out;
         }
         let term = self.persistent.current_term;
         let leading = self.volatile.role == Role::Leader;
@@ -862,13 +904,11 @@ impl RaftCore {
             .into_iter()
             .partition(|(_, _, read_term)| !leading || *read_term != term);
         self.pending_reads = keep;
-        stale
-            .into_iter()
-            .map(|(corr, _, _)| Outbound::ClientReply {
-                corr,
-                resp: ClientResponse::not_leader(hint),
-            })
-            .collect()
+        out.extend(stale.into_iter().map(|(corr, _, _)| Outbound::ClientReply {
+            corr,
+            resp: ClientResponse::not_leader(hint),
+        }));
+        out
     }
 
     async fn handle_message_inner(
@@ -1375,6 +1415,15 @@ impl RaftCore {
         out.extend(self.check_read_index_ready());
         if !out.is_empty() || self.volatile.commit_index != commit_before {
             self.persist().await?;
+        }
+        if self
+            .pending_transfer
+            .as_ref()
+            .is_some_and(|t| t.target == peer && self.target_caught_up(peer))
+        {
+            let t = self.pending_transfer.take().unwrap();
+            out.extend(self.send_timeout_now(t.target, t.corr).await?);
+            return Ok(out);
         }
         // Resume this peer if the ack freed in-flight budget. try_commit may
         // already have broadcast; a second pass is idempotent for the follower.
@@ -2116,21 +2165,48 @@ impl RaftCore {
                 resp: ClientResponse::err("target not a voter"),
             }]);
         }
-        let last = self.persistent.log.last_index();
-        let match_i = self
-            .leader
-            .as_ref()
-            .and_then(|l| l.match_index.get(&target).copied())
-            .unwrap_or(0);
-        if match_i < last {
-            // Do not step down until the target has the same log prefix.
-            let mut out = self.broadcast_append_entries();
-            out.push(Outbound::ClientReply {
+        if !self.target_caught_up(target) {
+            // Thesis §3.10 / etcd: keep replicating to the target and send
+            // TimeoutNow once it holds our whole log. The reply waits until
+            // then (or until the attempt times out after about one election
+            // timeout of heartbeat ticks).
+            let mut out = Vec::new();
+            if let Some(old) = self.pending_transfer.take() {
+                out.push(Outbound::ClientReply {
+                    corr: old.corr,
+                    resp: ClientResponse::err("transfer superseded"),
+                });
+            }
+            let hb = self.timing.heartbeat_ms.max(1);
+            let ticks = (self.timing.election_max_ms / hb).max(1) as u32 * 2;
+            self.pending_transfer = Some(PendingTransfer {
+                target,
                 corr,
-                resp: ClientResponse::err("target not caught up"),
+                term: self.persistent.current_term,
+                ticks_left: ticks,
             });
+            out.extend(self.replicate_peer_mode(target, true, true));
             return Ok(out);
         }
+        self.send_timeout_now(target, corr).await
+    }
+
+    /// `target` acked every entry in our log.
+    fn target_caught_up(&self, target: NodeId) -> bool {
+        let last = self.persistent.log.last_index();
+        self.leader
+            .as_ref()
+            .and_then(|l| l.match_index.get(&target).copied())
+            .unwrap_or(0)
+            >= last
+    }
+
+    /// Hand leadership to a caught-up `target` and step down.
+    async fn send_timeout_now(
+        &mut self,
+        target: NodeId,
+        corr: u64,
+    ) -> anyhow::Result<Vec<Outbound>> {
         let mut out = vec![Outbound::Send {
             to: target,
             msg: Message::TimeoutNow {
